@@ -2,7 +2,7 @@
  * @Author: xzr && zhenrxu@qq.com
  * @Date: 2026-03-19 19:50:07
  * @LastEditors: xzr && zhenrxu@qq.com
- * @LastEditTime: 2026-03-19 19:56:24
+ * @LastEditTime: 2026-04-08 09:59:00
  * @FilePath: /Tailsitter_ws/README.md
  * @Description: 尾座无人机控制
  * 
@@ -10,7 +10,7 @@
 -->
 1. 代码结构组成：
 ```
-UAV_Simulation/
+Tailsitter_ws/
 │
 ├── main_sim.py           # 仿真主程序：设置初始状态，运行仿真循环
 ├── config.py             # 参数配置：质量、转动惯量、气动导数、电机拟合系数等
@@ -29,7 +29,7 @@ UAV_Simulation/
     └── plotter.py        # 绘图脚本：可视化结果
 ```
 
-2. 需要用到的 python 包：
+2. 需要用到的 python = 3.12.12 包：
    - numpy
    - scipy
    - matplotlib
