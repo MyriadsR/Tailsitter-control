@@ -33,3 +33,10 @@ Tailsitter_ws/
    - numpy
    - scipy
    - matplotlib
+
+3. `vtol_sim` 环境快速配置：
+   - 依赖文件：`requirements-vtol_sim.txt`
+   - 一键脚本（包含包类型）：`setup_vtol_sim_env.sh`
+   - 使用方式：
+     - `./setup_vtol_sim_env.sh pip`（使用 `venv + pip`）
+     - `./setup_vtol_sim_env.sh conda`（使用 `conda + pip`）
