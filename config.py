@@ -2,7 +2,7 @@
 Author: xzr && zhenrxu@qq.com
 Date: 2026-03-20 10:08:24
 LastEditors: xzr && zhenrxu@qq.com
-LastEditTime: 2026-03-20 10:35:35
+LastEditTime: 2026-04-08 11:08:47
 FilePath: /Tailsitter_ws/config.py
 Description: 无人机配置参数
 
@@ -40,3 +40,19 @@ class TailsitterConfig:
         
         self.c_LV_delta = 0.18 # 襟翼偏转带来的升力导数 [cite: 670]
         self.c_LT_delta = 1.25 # 滑流中襟翼偏转的升力导数 [cite: 670]
+
+        # === 外环位置与速度控制器增益 (在机体坐标系下定义) ===
+        # 机体 X 轴 (纵向, 推力轴) 的控制通常可以稍微激进一点
+        self.kx_x = 4.0   
+        self.kv_x = 3.0   
+        self.ka_x = 0.0   # 加速度反馈增益 (初始可以设为0，主要靠前馈)
+
+        # 机体 Y 轴 (侧向) 没有任何气动面，响应最弱，全靠滚转带动，增益宜小
+        self.kx_y = 2.0   
+        self.kv_y = 1.5   
+        self.ka_y = 0.0   
+
+        # 机体 Z 轴 (法向) 依赖机翼升力和推力矢量，响应居中
+        self.kx_z = 3.0   
+        self.kv_z = 2.0   
+        self.ka_z = 0.0
