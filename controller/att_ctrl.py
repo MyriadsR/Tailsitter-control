@@ -20,7 +20,7 @@ class FlatnessAttitudeController:
         self.c_LT_delta = config.c_LT_delta
 
     def compute_desired_attitude_and_thrust(self, f_c_i, v_i, delta_sum, psi_ref, q_current):
-        """
+        r"""
         利用微分平坦变换，从期望受力反解期望姿态和推力 (论文公式 17-23)
         
         :param f_c_i: INDI 计算出的期望力向量 (世界系 NED) [3,]
@@ -190,7 +190,7 @@ class FlatnessAttitudeController:
         return q_c, T_c
     
     def compute_feedforward_angular_velocity(self, v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_c_i, phi, theta_bar, delta_sum):
-        """
+        r"""
         计算平坦变换的前馈角速度 \Omega_{ref} (论文公式 24-35)
         
         :param v_ref: 期望速度 [3,]
@@ -330,7 +330,7 @@ class PDAttitudeController:
         return np.array([q[0], -q[1], -q[2], -q[3]])
 
     def _quat_multiply(self, q1, q2):
-        """四元数乘法 q1 \circ q2"""
+        r"""四元数乘法 q1 \circ q2"""
         w1, x1, y1, z1 = q1
         w2, x2, y2, z2 = q2
         return np.array([
@@ -341,7 +341,7 @@ class PDAttitudeController:
         ])
 
     def compute_angular_acceleration_command(self, q_current, q_c, omega_lpf, omega_ref):
-        """
+        r"""
         计算期望角加速度 \dot{\Omega}_c (论文公式 47, 48, 49)
         
         :param q_current: 当前姿态四元数 \xi
@@ -386,7 +386,7 @@ class INDIAngularController:
         self.J = np.array(config.inertia_matrix, dtype=float)
 
     def compute_moment_command(self, omega_dot_c, omega_dot_lpf, m_lpf):
-        """
+        r"""
         利用 INDI 计算期望机体物理力矩 m_c (论文公式 52)
         
         :param omega_dot_c: PD姿态控制器算出的期望角加速度 \dot{\Omega}_c [3,]

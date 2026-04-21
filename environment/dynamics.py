@@ -46,7 +46,7 @@ class UAVDynamics:
         return R
 
     def _quat_derivative(self, quat, omega):
-        """
+        r"""
         实现公式 (3)：四元数运动学导数 (1/2 * xi \circ Omega)
         """
         qw, qx, qy, qz = quat

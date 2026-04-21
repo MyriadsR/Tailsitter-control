@@ -97,13 +97,13 @@ class Aerodynamics:
         
         # 1. 推力带来的力矩 (Eq 10)
         # 注意：此处包含了推力偏心引发的滚转、偏航，以及纵向的俯仰力矩
-        i_x = np.array([[1.0], [0.0], [0.0]])
-        i_z = np.array([[0.0], [0.0], [1.0]])
+        i_x = np.array([1.0, 0.0, 0.0])
+        i_z = np.array([0.0, 0.0, 1.0])
 
         m_T = np.array([
-            self.cfg.l_Ty * i_z.T @ R_alpha_to_b @ (f_T2_alpha - f_T1_alpha),
+            self.cfg.l_Ty * (i_z @ R_alpha_to_b @ (f_T2_alpha - f_T1_alpha)),
             self.cfg.c_mu_T * (T1 + T2),
-            self.cfg.l_Ty * i_x.T @ R_alpha_to_b @ (f_T1_alpha - f_T2_alpha)
+            self.cfg.l_Ty * (i_x @ R_alpha_to_b @ (f_T1_alpha - f_T2_alpha))
         ])
         
         # 2. 螺旋桨反扭矩引起的力矩 (Eq 11 & Eq 12)
