@@ -301,12 +301,13 @@ class FlatnessAttitudeController:
         # ==========================================
         # 需要将三部分的角速度全部统一投影到机体坐标系下
         # R_phi_to_b: 从 phi 坐标系转到最终机体系 (绕 Y 轴旋转 theta)
+        # 注意这里 theta 自带正负号
         theta = theta_bar + self.alpha_0
         c_th, s_th = np.cos(theta), np.sin(theta)
         R_phi_to_b = np.array([
-            [ c_th,  0, -s_th],
+            [ c_th,  0,  s_th],
             [    0,  1,     0],
-            [ s_th,  0,  c_th]
+            [-s_th,  0,  c_th]
         ])
         
         R_i_to_b = R_phi_to_b @ R_i_to_phi

@@ -64,6 +64,7 @@ class ControlAllocator:
         # ==========================================
         # 1. 重新计算电机推力在 机体系(b) 下产生的力矩 m_T
         # （复用 aerodynamics.py 里的逻辑）
+        # 注意求旋转矩阵时的角度正负号，因为 alpha_0 是负的！！！！！！！！！！！！！！
         f_Ti_alpha_x = self.c_at * (1 - self.cfg.c_DT)
         f_Ti_alpha_z = self.s_at * (self.cfg.c_LT - 1)
         f_Ti_b_x = self.c_a0 * f_Ti_alpha_x - self.s_a0 * f_Ti_alpha_z
@@ -90,7 +91,8 @@ class ControlAllocator:
         # 第四步：求解期望襟翼偏角 delta (Eq 39, 40)
         # ==========================================
         # 获得零升力坐标系下的 X 轴速度 v_x^\alpha
-        v_alpha_x = self.c_a0 * v_b[0] - self.s_a0 * v_b[2]
+        # 注意求旋转矩阵时的角度正负号，因为 alpha_0 是负的
+        v_alpha_x = self.c_a0 * v_b[0] + self.s_a0 * v_b[2]
         
         # 计算 \nu_1 和 \nu_2 (Eq 40) 
         nu_1 = -self.cfg.c_LT_delta * self.c_at * T1 - self.cfg.c_LV_delta * v_norm * v_alpha_x

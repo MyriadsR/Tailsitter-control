@@ -32,13 +32,14 @@ class Aerodynamics:
             v_norm = 1e-3
             
         # 1. 坐标系转换：计算零升力系下的速度 v_alpha
-        # 绕 Y 轴旋转 -alpha_0
-        ca0 = np.cos(-self.cfg.alpha_0)
-        sa0 = np.sin(-self.cfg.alpha_0)
+        # 绕 Y 轴旋转 alpha_0（角度符号由 alpha_0 自身决定）
+        # 注意这里 theta 自带正负号
+        ca0 = np.cos(self.cfg.alpha_0)
+        sa0 = np.sin(self.cfg.alpha_0)
         R_b_to_alpha = np.array([
-            [ ca0, 0, -sa0],
+            [ ca0, 0,  sa0],
             [   0, 1,    0],
-            [ sa0, 0,  ca0]
+            [-sa0, 0,  ca0]
         ])
         R_alpha_to_b = R_b_to_alpha.T
 
