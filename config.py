@@ -19,7 +19,8 @@ class TailsitterConfig:
         
         # === 几何参数 ===
         self.alpha_0 = np.deg2rad(-2.0)  # 零升力迎角 (估算值, 稍微带有弯度的翼型)
-        self.alpha_T = np.deg2rad(-5.0)  # 推力安装角 [cite: 693]
+        # self.alpha_T = np.deg2rad(-5.0)  # 推力安装角 [cite: 693]
+        self.alpha_T = np.deg2rad(0.0)  # 推力安装角 [cite: 693]
         
         # 几何臂长 (m)
         self.l_Ty = 0.15     # 电机到纵轴(X轴)的横向距离 (估算值)
@@ -29,7 +30,8 @@ class TailsitterConfig:
         # === 推力与电机参数 ===
         self.c_T = 1.2e-5    # 螺旋桨推力系数 (T = c_T * omega^2) (常规5寸桨估算)
         self.c_mu = 1.5e-7   # 螺旋桨反扭矩系数 (常规估算)
-        self.c_mu_T = -0.025 # 推力俯仰力矩系数 [cite: 786]
+        # self.c_mu_T = -0.025 # 推力俯仰力矩系数 [cite: 786]
+        self.c_mu_T = 0 # 推力俯仰力矩系数 [cite: 786]
         
         # === alpha-theory 气动参数 (基于论文 Table 2 实验测量值) ===
         self.c_LV = 0.29     # 机翼升力系数 [cite: 670]
@@ -66,14 +68,14 @@ class TailsitterConfig:
         ]
 
         # === 内环姿态 PD 控制器增益 ===
-        # 滚转轴 (Roll - 靠差速推力，响应极快)
-        self.k_xi_roll = 60.0
-        self.k_omega_roll = 15.0
+        # 滚转轴 (Roll - 靠副翼/差动舵面)
+        self.k_xi_roll = 40.0
+        self.k_omega_roll = 10.0
         
         # 俯仰轴 (Pitch - 靠升降舵，受空速影响，响应略慢)
-        self.k_xi_pitch = 40.0
-        self.k_omega_pitch = 10.0
+        self.k_xi_pitch = 28.0
+        self.k_omega_pitch = 7.0
         
-        # 偏航轴 (Yaw - 靠副翼/差动舵面)
-        self.k_xi_yaw = 40.0
-        self.k_omega_yaw = 10.0
+        # 偏航轴 (Yaw - 靠差速推力，响应极快)
+        self.k_xi_yaw = 28.0
+        self.k_omega_yaw = 7.0
