@@ -20,14 +20,14 @@ from controller.actuator_ctrl import ControlAllocator
 from utils.math_help import zxy_euler_to_quaternion
 
 
-def euler_from_quaternion(q):
-    """工具函数：将四元数转换为 ZXY 欧拉角 (仅用于绘图)"""
+def zxy_euler_from_quaternion(q):
+    """工具函数：将四元数转换为 ZXY 欧拉角 [psi, phi, theta]。"""
     qw, qx, qy, qz = q
-    # ZXY 提取 (近似)
-    roll = np.arcsin(2.0 * (qw * qx + qy * qz))
-    pitch = np.arctan2(2.0 * (qw * qy - qx * qz), 1.0 - 2.0 * (qx**2 + qy**2))
-    yaw = np.arctan2(2.0 * (qw * qz - qx * qy), 1.0 - 2.0 * (qx**2 + qz**2))
-    return np.array([roll, pitch, yaw])
+    # ZXY 提取（对应关系：phi=Roll, theta=Pitch, psi=Yaw）
+    phi = np.arcsin(2.0 * (qw * qx + qy * qz))
+    theta = np.arctan2(2.0 * (qw * qy - qx * qz), 1.0 - 2.0 * (qx**2 + qy**2))
+    psi = np.arctan2(2.0 * (qw * qz - qx * qy), 1.0 - 2.0 * (qx**2 + qz**2))
+    return np.array([psi, phi, theta])
 
 
 def quintic_segment(distance, tau, duration):
@@ -72,12 +72,21 @@ def main():
     allocator= ControlAllocator(cfg)
     
     # === 仿真参数 ===
-    dt = 0.005  # 200Hz 控制频率
+    dt = 0.01  # 100Hz 控制频率
     takeoff_duration = 6.0
-    hover_1_duration = 2.0
+    hover_1_duration = 5.0
     forward_duration = 6.0
-    hover_2_duration = 2.0
-    t_end = takeoff_duration + hover_1_duration + forward_duration + hover_2_duration
+    hover_2_duration = 5.0
+    right_duration = 6.0
+    hover_3_duration = 5.0
+    t_end = (
+        takeoff_duration
+        + hover_1_duration
+        + forward_duration
+        + hover_2_duration
+        + right_duration
+        + hover_3_duration
+    )
     steps = int(t_end / dt) + 1
     
     # === 初始状态 ===
@@ -106,11 +115,12 @@ def main():
     # 记录数据用的列表
     log_t, log_pos, log_euler, log_rotors, log_flaps = [], [], [], [], []
     
-    # 预计算常数旋转矩阵
+    # 预计算常数旋转矩阵（角度符号由 alpha_0 自身决定）
+    # 注意这里 alpha_0 自带正负号
     ca0, sa0 = np.cos(cfg.alpha_0), np.sin(cfg.alpha_0)
-    R_b_to_alpha = np.array([[ca0, 0, -sa0], [0, 1, 0], [sa0, 0, ca0]])
+    R_b_to_alpha = np.array([[ca0, 0, sa0], [0, 1, 0], [-sa0, 0, ca0]])
     R_alpha_to_b = R_b_to_alpha.T
-    gravity_comp_i = np.array([0.0, 0.0, -cfg.g])  # NED 下抵消重力需沿 -Z 方向补偿
+    # gravity_comp_i = np.array([0.0, 0.0, -cfg.g])  # NED 下抵消重力需沿 -Z 方向补偿
 
     print("开始仿真运行...")
     for step in range(steps):
@@ -124,7 +134,13 @@ def main():
         R_i_to_b = dyn._quat_to_rot_matrix(q_curr).T
         R_b_to_i = R_i_to_b.T
         
-        # 2. 任务轨迹：垂直起飞到 10m -> 悬停 2s -> 前飞 10m -> 悬停 2s
+        # 2. 任务轨迹：垂直起飞到 10m -> 悬停 5s -> 前飞 10m -> 悬停 5s -> 向右飞 10m -> 悬停 5s
+        t_takeoff_end = takeoff_duration
+        t_hover1_end = t_takeoff_end + hover_1_duration
+        t_forward_end = t_hover1_end + forward_duration
+        t_hover2_end = t_forward_end + hover_2_duration
+        t_right_end = t_hover2_end + right_duration
+
         if t <= takeoff_duration:
             tau = t / takeoff_duration
             z_pos, z_vel, z_acc, z_jerk = quintic_segment(-10.0, tau, takeoff_duration)
@@ -132,20 +148,32 @@ def main():
             v_ref = np.array([0.0, 0.0, z_vel])
             a_ref = np.array([0.0, 0.0, z_acc])
             j_ref = np.array([0.0, 0.0, z_jerk])
-        elif t <= takeoff_duration + hover_1_duration:
+        elif t <= t_hover1_end:
             x_ref = np.array([0.0, 0.0, -10.0])
             v_ref = np.array([0.0, 0.0, 0.0])
             a_ref = np.array([0.0, 0.0, 0.0])
             j_ref = np.array([0.0, 0.0, 0.0])
-        elif t <= takeoff_duration + hover_1_duration + forward_duration:
-            tau = (t - takeoff_duration - hover_1_duration) / forward_duration
+        elif t <= t_forward_end:
+            tau = (t - t_hover1_end) / forward_duration
             x_pos, x_vel, x_acc, x_jerk = quintic_segment(10.0, tau, forward_duration)
             x_ref = np.array([x_pos, 0.0, -10.0])
             v_ref = np.array([x_vel, 0.0, 0.0])
             a_ref = np.array([x_acc, 0.0, 0.0])
             j_ref = np.array([x_jerk, 0.0, 0.0])
-        else:
+        elif t <= t_hover2_end:
             x_ref = np.array([10.0, 0.0, -10.0])
+            v_ref = np.array([0.0, 0.0, 0.0])
+            a_ref = np.array([0.0, 0.0, 0.0])
+            j_ref = np.array([0.0, 0.0, 0.0])
+        elif t <= t_right_end:
+            tau = (t - t_hover2_end) / right_duration
+            y_pos, y_vel, y_acc, y_jerk = quintic_segment(10.0, tau, right_duration)
+            x_ref = np.array([10.0, y_pos, -10.0])
+            v_ref = np.array([0.0, y_vel, 0.0])
+            a_ref = np.array([0.0, y_acc, 0.0])
+            j_ref = np.array([0.0, y_jerk, 0.0])
+        else:
+            x_ref = np.array([10.0, 10.0, -10.0])
             v_ref = np.array([0.0, 0.0, 0.0])
             a_ref = np.array([0.0, 0.0, 0.0])
             j_ref = np.array([0.0, 0.0, 0.0])
@@ -162,11 +190,9 @@ def main():
         delta_sum = delta_flaps[0] + delta_flaps[1]
         q_c, T_c = att_flat.compute_desired_attitude_and_thrust(f_c_i, vel, delta_sum, psi_ref, q_curr)
         
-        # 求解平坦前馈角速度 (如果飞简单轨迹，j_ref 为 0 也非常稳定)
-        # 需要从中提取 phi 和 theta_bar (从 q_c 还原，或改造函数直接返回)
-        # 为了简单，此处直接调用：
-        phi = euler_from_quaternion(q_c)[0]
-        theta_bar = euler_from_quaternion(q_c)[1] - cfg.alpha_0
+        # 求解平坦前馈角速度（从 q_c 提取 ZXY 欧拉角 [psi, phi, theta]）
+        _, phi, theta_c = zxy_euler_from_quaternion(q_c)
+        theta_bar = theta_c - cfg.alpha_0
         omega_ref = att_flat.compute_feedforward_angular_velocity(
             v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_c_i, phi, theta_bar, delta_sum
         )
@@ -180,7 +206,7 @@ def main():
         omega_cmd, delta_cmd = allocator.allocate_controls(T_c, m_c, v_b)
         
         # 模拟执行器延迟 (一阶低通滤波)
-        alpha_act = 0.5
+        alpha_act = 0.8
         omega_rotors = alpha_act * omega_cmd + (1 - alpha_act) * omega_rotors
         delta_flaps = alpha_act * delta_cmd + (1 - alpha_act) * delta_flaps
         
@@ -203,7 +229,7 @@ def main():
         # 9. 更新 INDI 滤波器状态 (在实际代码中来自传感器)
         # 世界系下的实际加速度 (不扣除重力，直接使用 v_dot)
         a_real_i = state_dot[3:6]
-        alpha_lpf = 0.2  # 低通滤波系数
+        alpha_lpf = 0.35  # 低通滤波系数
         a_lpf_tilde = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf_tilde
         omega_dot_lpf = alpha_lpf * state_dot[10:13] + (1 - alpha_lpf) * omega_dot_lpf
         f_alpha_lpf = alpha_lpf * f_alpha_real + (1 - alpha_lpf) * f_alpha_lpf
@@ -212,7 +238,7 @@ def main():
         # 记录日志
         log_t.append(t)
         log_pos.append(pos)
-        log_euler.append(np.rad2deg(euler_from_quaternion(q_curr)))
+        log_euler.append(np.rad2deg(zxy_euler_from_quaternion(q_curr)))
         log_rotors.append(omega_rotors)
         log_flaps.append(np.rad2deg(delta_flaps))
 
@@ -238,9 +264,9 @@ def main():
     plt.title('Tailsitter Trajectory & Attitude Simulation')
     
     plt.subplot(3, 1, 2)
-    plt.plot(log_t, log_euler[:, 0], label='Roll (deg)')
-    plt.plot(log_t, log_euler[:, 1], label='Pitch (deg)')
-    plt.plot(log_t, log_euler[:, 2], label='Yaw (deg)')
+    plt.plot(log_t, log_euler[:, 0], label='Yaw (deg)')
+    plt.plot(log_t, log_euler[:, 1], label='Roll (deg)')
+    plt.plot(log_t, log_euler[:, 2], label='Pitch (deg)')
     plt.ylabel('Euler Angles (deg)')
     plt.legend()
     plt.grid()
