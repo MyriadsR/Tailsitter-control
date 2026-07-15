@@ -189,7 +189,7 @@ class FlatnessAttitudeController:
         
         return q_c, T_c
     
-    def compute_feedforward_angular_velocity(self, v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_c_i, phi, theta_bar, delta_sum):
+    def compute_feedforward_angular_velocity(self, v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_i, phi, theta_bar, delta_sum):
         r"""
         计算平坦变换的前馈角速度 \Omega_{ref} (论文公式 24-35)
         
@@ -198,8 +198,8 @@ class FlatnessAttitudeController:
         :param j_ref: 期望 Jerk (加速度的导数) [3,]
         :param psi_ref: 期望偏航角
         :param psi_dot_ref: 期望偏航角速度
-        :param f_c_i: 期望力 (世界系)
-        :param phi: 已解算出的期望滚转角
+        :param f_i: 参考力 (世界系), 应为 m(a_ref - g*i_z); 前馈严格由参考轨迹导出
+        :param phi: 由参考力解算出的参考滚转角
         :param theta_bar: 已解算出的期望零升力俯仰角
         :param delta_sum: 襟翼偏角之和
         :return: omega_ref 期望机体角速度 [3,]
@@ -237,11 +237,11 @@ class FlatnessAttitudeController:
         # 1. 求解滚转角速度 phi_dot (Eq 24-26)
         # ==========================================
         # beta_x = -sin(psi)*fx^i + cos(psi)*fy^i  (即 f_psi 的 y 分量)
-        beta_x = -s_psi * f_c_i[0] + c_psi * f_c_i[1]
-        beta_z = f_c_i[2]
-        
+        beta_x = -s_psi * f_i[0] + c_psi * f_i[1]
+        beta_z = f_i[2]
+
         # 对 beta_x 和 beta_z 求导
-        beta_x_dot = -psi_dot_ref * (c_psi * f_c_i[0] + s_psi * f_c_i[1]) - s_psi * f_dot_i[0] + c_psi * f_dot_i[1]
+        beta_x_dot = -psi_dot_ref * (c_psi * f_i[0] + s_psi * f_i[1]) - s_psi * f_dot_i[0] + c_psi * f_dot_i[1]
         beta_z_dot = f_dot_i[2]
         
         # phi_dot = - (beta_x*beta_z_dot - beta_x_dot*beta_z) / (beta_x^2 + beta_z^2) (Eq 24)
@@ -253,13 +253,13 @@ class FlatnessAttitudeController:
 
         # ==========================================
         # 2. 求解坐标系内的导数 v_phi_dot 和 f_phi_dot (Eq 34)
-        # 这里还得多注意是不是对的！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！！
+        # 已核对: 输运定理 v_dot^phi = R_i^phi @ a - omega x v^phi, 符号正确。
         # ==========================================
         # phi 坐标系相对于世界系的角速度 (投影在 phi 坐标系下)
         omega_phi_i_in_phi = R_i_to_phi @ np.array([0, 0, psi_dot_ref]) + np.array([phi_dot, 0, 0])
         
         v_phi = R_i_to_phi @ v_ref
-        f_phi = R_i_to_phi @ f_c_i
+        f_phi = R_i_to_phi @ f_i
         
         # 根据输运定理 (Transport Theorem) 求局部导数
         v_phi_dot = R_i_to_phi @ a_ref - np.cross(omega_phi_i_in_phi, v_phi)
@@ -300,14 +300,16 @@ class FlatnessAttitudeController:
         # 4. 组装最终的前馈角速度 Omega_ref (Eq 35)
         # ==========================================
         # 需要将三部分的角速度全部统一投影到机体坐标系下
-        # R_phi_to_b: 从 phi 坐标系转到最终机体系 (绕 Y 轴旋转 theta)
-        # 注意这里 theta 自带正负号
+        # R_phi_to_b: 从 phi 坐标系到机体系的坐标变换 DCM (绕 Y 轴旋转 theta)
+        # 注意: 绕 Y 轴的 DCM 其 sin 符号模式与绕 X/Z 相同,
+        #       即 [[c,0,-s],[0,1,0],[s,0,c]], 与 R_i_to_psi / R_psi_to_phi
+        #       以及 zxy_euler_to_quaternion 的姿态约定保持一致。
         theta = theta_bar + self.alpha_0
         c_th, s_th = np.cos(theta), np.sin(theta)
         R_phi_to_b = np.array([
-            [ c_th,  0,  s_th],
+            [ c_th,  0, -s_th],
             [    0,  1,     0],
-            [-s_th,  0,  c_th]
+            [ s_th,  0,  c_th]
         ])
         
         R_i_to_b = R_phi_to_b @ R_i_to_phi
