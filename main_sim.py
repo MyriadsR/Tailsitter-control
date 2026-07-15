@@ -1,5 +1,5 @@
 '''
-Author: You & Gemini
+Author: ZR
 Description: Tailsitter 飞翼无人机全系统闭环仿真主程序
 '''
 import numpy as np
@@ -102,10 +102,14 @@ def main():
     state = np.concatenate([pos_0, vel_0, q_0, omega_0])
     
     # === INDI 滤波器初始状态 (低通滤波后的历史值) ===
-    a_lpf_tilde = np.array([0.0, 0.0, cfg.g])  # 世界系下的线加速度
+    a_lpf = np.array([0.0, 0.0, cfg.g])        # 世界系实际加速度的低通 (论文 a_lpf)
+    a_lpf_tilde = np.array([0.0, 0.0, cfg.g])  # 去除瞬态襟翼分量后的加速度 (论文 Eq 43)
     omega_dot_lpf = np.array([0.0, 0.0, 0.0])
-    f_alpha_lpf = np.array([0.0, 0.0, 0.0]) 
+    f_alpha_lpf = np.array([0.0, 0.0, 0.0])
     m_lpf = np.array([0.0, 0.0, 0.0])
+    # 襟翼力带通(LP->HP)滤波历史, 用于提取瞬态襟翼分量 f_delta_hpf (论文 Eq 43)
+    f_delta_lp = np.zeros(3)
+    f_delta_slow = np.zeros(3)
     
     # 初始执行器状态
     # hover_thrust_per_motor = (cfg.mass * cfg.g) / 2.0
@@ -114,6 +118,7 @@ def main():
     
     # 记录数据用的列表
     log_t, log_pos, log_euler, log_rotors, log_flaps = [], [], [], [], []
+    log_x_ref = []
     
     # 预计算常数旋转矩阵（角度符号由 alpha_0 自身决定）
     # 注意这里 alpha_0 自带正负号
@@ -187,14 +192,19 @@ def main():
         f_c_i = indi_lin.compute_force_command(a_c, a_lpf_tilde, f_alpha_lpf, R_b_to_i, R_alpha_to_b)
         
         # 4. 微分平坦变换 (受力 -> 姿态与推力)
+        # 姿态/推力指令基于 INDI 实际力指令 f_c_i (含反馈, 论文 Eq 46)
         delta_sum = delta_flaps[0] + delta_flaps[1]
         q_c, T_c = att_flat.compute_desired_attitude_and_thrust(f_c_i, vel, delta_sum, psi_ref, q_curr)
-        
-        # 求解平坦前馈角速度（从 q_c 提取 ZXY 欧拉角 [psi, phi, theta]）
-        _, phi, theta_c = zxy_euler_from_quaternion(q_c)
-        theta_bar = theta_c - cfg.alpha_0
+
+        # 平坦前馈角速度 Omega_ref: 严格由"参考轨迹"导出 (论文 Sec III.B), 与含反馈的
+        # 指令路径解耦。参考力 f_ref^i = m(a_ref - g*i_z) (Eq 16, 设 f_ext=0), 并用参考力
+        # 解算对应的参考姿态 (phi_ref, theta_bar_ref), 再据此求 Omega_ref。
+        f_ref_i = cfg.mass * (a_ref - np.array([0.0, 0.0, cfg.g]))
+        q_ref, _ = att_flat.compute_desired_attitude_and_thrust(f_ref_i, v_ref, delta_sum, psi_ref, q_curr)
+        _, phi_ref, theta_ref = zxy_euler_from_quaternion(q_ref)
+        theta_bar_ref = theta_ref - cfg.alpha_0
         omega_ref = att_flat.compute_feedforward_angular_velocity(
-            v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_c_i, phi, theta_bar, delta_sum
+            v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_ref_i, phi_ref, theta_bar_ref, delta_sum
         )
         
         # 5. 内环控制 (姿态 -> 期望角加速度 -> INDI 期望力矩)
@@ -211,7 +221,7 @@ def main():
         delta_flaps = alpha_act * delta_cmd + (1 - alpha_act) * delta_flaps
         
         # 7. 物理环境计算真实的受力与力矩
-        f_alpha_real, m_body_real = aero.compute_forces_and_moments(
+        f_alpha_real, m_body_real, f_delta_alpha_real = aero.compute_forces_and_moments(
             v_b, omega_rotors[0], omega_rotors[1], delta_flaps[0], delta_flaps[1]
         )
         
@@ -227,10 +237,23 @@ def main():
                 state[5] = 0.0
         
         # 9. 更新 INDI 滤波器状态 (在实际代码中来自传感器)
-        # 世界系下的实际加速度 (不扣除重力，直接使用 v_dot)
+        alpha_lpf = 0.35   # 主低通滤波系数 (~15Hz 等效)
+        alpha_hpf = 0.06   # 慢变低通系数 (~1Hz), 用于构造带通
+
+        # (a) 世界系实际加速度 (= v_dot, 已含重力, 对应论文 a_lpf)
         a_real_i = state_dot[3:6]
-        alpha_lpf = 0.35  # 低通滤波系数
-        a_lpf_tilde = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf_tilde
+        a_lpf = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf
+
+        # (b) 瞬态襟翼加速度修正 (论文 Eq 43):
+        #     a_tilde_lpf = a_lpf - m^-1 * R_alpha^i * f_delta_hpf^alpha
+        #     带通提取襟翼力瞬态分量: 先与主低通同相(LP), 再减去其慢变(<~1Hz)分量(HP)。
+        R_alpha_to_i = R_b_to_i @ R_alpha_to_b
+        f_delta_lp = alpha_lpf * f_delta_alpha_real + (1 - alpha_lpf) * f_delta_lp
+        f_delta_slow = alpha_hpf * f_delta_lp + (1 - alpha_hpf) * f_delta_slow
+        f_delta_hpf = f_delta_lp - f_delta_slow
+        a_lpf_tilde = a_lpf - (1.0 / cfg.mass) * (R_alpha_to_i @ f_delta_hpf)
+
+        # (c) 其余 INDI 反馈信号
         omega_dot_lpf = alpha_lpf * state_dot[10:13] + (1 - alpha_lpf) * omega_dot_lpf
         f_alpha_lpf = alpha_lpf * f_alpha_real + (1 - alpha_lpf) * f_alpha_lpf
         m_lpf = alpha_lpf * m_body_real + (1 - alpha_lpf) * m_lpf
@@ -238,6 +261,7 @@ def main():
         # 记录日志
         log_t.append(t)
         log_pos.append(pos)
+        log_x_ref.append(x_ref)
         log_euler.append(np.rad2deg(zxy_euler_from_quaternion(q_curr)))
         log_rotors.append(omega_rotors)
         log_flaps.append(np.rad2deg(delta_flaps))
@@ -247,9 +271,14 @@ def main():
     # === 绘图 ===
     log_t = np.array(log_t)
     log_pos = np.array(log_pos)
+    log_x_ref = np.array(log_x_ref)
     log_euler = np.array(log_euler)
     log_rotors = np.array(log_rotors)
     log_flaps = np.array(log_flaps)
+
+    # 位置跟踪误差统计 (RMS / 最大)
+    pos_err_norm = np.linalg.norm(log_x_ref - log_pos, axis=1)
+    print(f"位置跟踪误差:  RMS = {np.sqrt(np.mean(pos_err_norm**2)):.3f} m,  最大 = {pos_err_norm.max():.3f} m")
     
     plt.figure(figsize=(12, 10))
     

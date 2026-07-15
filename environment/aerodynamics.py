@@ -24,7 +24,7 @@ class Aerodynamics:
         :param v_b: 机体坐标系下的速度向量 [vx, vy, vz] (m/s)
         :param omega_1, omega_2: 左右电机转速 (rad/s)
         :param delta_1, delta_2: 左右襟翼偏角 (rad)
-        :return: f_alpha (零升力系下的3D受力), m_body (机体系下的3D力矩)
+        :return: f_alpha (零升力系3D受力), m_body (机体系3D力矩), f_delta_alpha (零升力系襟翼力, 供 Eq 43 瞬态修正)
         """
         v_norm = np.linalg.norm(v_b)
         # 防止除以零
@@ -33,7 +33,7 @@ class Aerodynamics:
             
         # 1. 坐标系转换：计算零升力系下的速度 v_alpha
         # 绕 Y 轴旋转 alpha_0（角度符号由 alpha_0 自身决定）
-        # 注意这里 theta 自带正负号
+        # 注意这里 alpha 自带正负号
         ca0 = np.cos(self.cfg.alpha_0)
         sa0 = np.sin(self.cfg.alpha_0)
         R_b_to_alpha = np.array([
@@ -135,5 +135,5 @@ class Aerodynamics:
         
         # 4. 机体坐标系下的合力矩 (Eq 14)
         m_body = m_T + m_mu + m_delta
-        
-        return f_alpha, m_body
+
+        return f_alpha, m_body, f_delta_alpha
