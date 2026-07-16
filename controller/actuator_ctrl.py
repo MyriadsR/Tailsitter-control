@@ -17,6 +17,37 @@ class ControlAllocator:
         self.c_aT = np.cos(self.cfg.alpha_T)
         self.s_aT = np.sin(self.cfg.alpha_T)
 
+    @staticmethod
+    def _bounded_flap_allocation(M, b_vec, max_deflection):
+        """求解二维有界最小二乘，避免逐元素截断破坏滚转/俯仰折中。"""
+        candidates = []
+
+        unconstrained = np.linalg.pinv(M) @ b_vec
+        if np.all(np.abs(unconstrained) <= max_deflection):
+            candidates.append(unconstrained)
+
+        # 最优解若不在内部，必然位于某条边界；固定一个舵面后解析求另一个。
+        for fixed_index in (0, 1):
+            free_index = 1 - fixed_index
+            free_column = M[:, free_index]
+            free_norm_sq = free_column @ free_column
+            for fixed_value in (-max_deflection, max_deflection):
+                candidate = np.zeros(2)
+                candidate[fixed_index] = fixed_value
+                residual_target = b_vec - M[:, fixed_index] * fixed_value
+                if free_norm_sq > 1e-12:
+                    free_value = (free_column @ residual_target) / free_norm_sq
+                else:
+                    free_value = 0.0
+                candidate[free_index] = np.clip(
+                    free_value, -max_deflection, max_deflection
+                )
+                candidates.append(candidate)
+
+        if not candidates:
+            return np.zeros(2)
+        return min(candidates, key=lambda delta: np.linalg.norm(M @ delta - b_vec))
+
     def allocate_controls(self, T_c, m_c, v_b):
         """
         根据期望总推力 T_c 和机体力矩 m_c，分配电机转速和舵偏角
@@ -47,13 +78,13 @@ class ControlAllocator:
         # ==========================================
         # 第二步：计算单电机推力与转速 (Eq 38, Eq 6)
         # ==========================================
-        # 分配推力 
+        # 在保持总推力的前提下约束差分推力，使 T1、T2 均非负。
+        # 直接把负的单电机推力截为零会改变总推力，并使后续力矩剥离失配。
+        T_c = max(float(T_c), 0.0)
+        delta_T = np.clip(delta_T, -T_c, T_c)
         T1 = (T_c + delta_T) / 2.0
         T2 = (T_c - delta_T) / 2.0
-        
-        # 物理限制：推力不能为负
-        T1 = max(T1, 0.0)
-        T2 = max(T2, 0.0)
+        realized_delta_T = T1 - T2
         
         # 反解期望转速 omega_c = sqrt(T / c_T) 
         omega_1_cmd = np.sqrt(T1 / self.cfg.c_T)
@@ -77,7 +108,7 @@ class ControlAllocator:
         ])
         
         # 2. 计算电机反扭矩 m_mu
-        mu_sum = (self.cfg.c_mu / self.cfg.c_T) * delta_T  # mu_1 + mu_2 的极简代换
+        mu_sum = (self.cfg.c_mu / self.cfg.c_T) * realized_delta_T
         m_mu = np.array([
              self.c_aT * mu_sum,
              0.0,
@@ -107,16 +138,10 @@ class ControlAllocator:
         # 取出期望舵面力矩的 X (滚转) 和 Y (俯仰) 分量
         b_vec = np.array([m_delta_c[0], m_delta_c[1]])
         
-        # 使用伪逆 (pinv) 求解以防止在零动压/零推力时矩阵奇异
-        delta_cmd = np.linalg.pinv(M) @ b_vec
-        
-        delta_1_cmd = delta_cmd[0]
-        delta_2_cmd = delta_cmd[1]
-        
-        # 物理舵偏角限幅 (例如 +/- 45度)
+        # 物理舵偏角限幅，并在边界上重新优化剩余自由度。
         max_deflection = np.deg2rad(45.0)
-        delta_1_cmd = np.clip(delta_1_cmd, -max_deflection, max_deflection)
-        delta_2_cmd = np.clip(delta_2_cmd, -max_deflection, max_deflection)
+        delta_cmd = self._bounded_flap_allocation(M, b_vec, max_deflection)
+        delta_1_cmd, delta_2_cmd = delta_cmd
         
         return np.array([omega_1_cmd, omega_2_cmd]), np.array([delta_1_cmd, delta_2_cmd])
 
