@@ -24,7 +24,8 @@ def zxy_euler_from_quaternion(q):
     """工具函数：将四元数转换为 ZXY 欧拉角 [psi, phi, theta]。"""
     qw, qx, qy, qz = q
     # ZXY 提取（对应关系：phi=Roll, theta=Pitch, psi=Yaw）
-    phi = np.arcsin(2.0 * (qw * qx + qy * qz))
+    sin_phi = np.clip(2.0 * (qw * qx + qy * qz), -1.0, 1.0)
+    phi = np.arcsin(sin_phi)
     theta = np.arctan2(2.0 * (qw * qy - qx * qz), 1.0 - 2.0 * (qx**2 + qy**2))
     psi = np.arctan2(2.0 * (qw * qz - qx * qy), 1.0 - 2.0 * (qx**2 + qz**2))
     return np.array([psi, phi, theta])
@@ -107,9 +108,11 @@ def main():
     omega_dot_lpf = np.array([0.0, 0.0, 0.0])
     f_alpha_lpf = np.array([0.0, 0.0, 0.0])
     m_lpf = np.array([0.0, 0.0, 0.0])
-    # 襟翼力带通(LP->HP)滤波历史, 用于提取瞬态襟翼分量 f_delta_hpf (论文 Eq 43)
-    f_delta_lp = np.zeros(3)
-    f_delta_slow = np.zeros(3)
+    # 执行器测量滤波状态。delta_flaps_slow 是去除瞬态后的低频舵面分量，
+    # 同时用于平坦性变换和 Eq. (46) 中的 f_lpf，保证 INDI 两边信号一致。
+    omega_rotors_lpf = np.zeros(2)
+    delta_flaps_lpf = np.zeros(2)
+    delta_flaps_slow = np.zeros(2)
     
     # 初始执行器状态
     # hover_thrust_per_motor = (cfg.mass * cfg.g) / 2.0
@@ -193,16 +196,24 @@ def main():
         
         # 4. 微分平坦变换 (受力 -> 姿态与推力)
         # 姿态/推力指令基于 INDI 实际力指令 f_c_i (含反馈, 论文 Eq 46)
-        delta_sum = delta_flaps[0] + delta_flaps[1]
+        # 论文 Sec. III.A 只在线加速度控制中使用近似恒定的低频舵面分量。
+        delta_sum = np.sum(delta_flaps_slow)
         q_c, T_c = att_flat.compute_desired_attitude_and_thrust(f_c_i, vel, delta_sum, psi_ref, q_curr)
 
         # 平坦前馈角速度 Omega_ref: 严格由"参考轨迹"导出 (论文 Sec III.B), 与含反馈的
         # 指令路径解耦。参考力 f_ref^i = m(a_ref - g*i_z) (Eq 16, 设 f_ext=0), 并用参考力
         # 解算对应的参考姿态 (phi_ref, theta_bar_ref), 再据此求 Omega_ref。
         f_ref_i = cfg.mass * (a_ref - np.array([0.0, 0.0, cfg.g]))
-        q_ref, _ = att_flat.compute_desired_attitude_and_thrust(f_ref_i, v_ref, delta_sum, psi_ref, q_curr)
-        _, phi_ref, theta_ref = zxy_euler_from_quaternion(q_ref)
-        theta_bar_ref = theta_ref - cfg.alpha_0
+        # 直接使用平坦性变换选取的原始角度分支。若先转换为四元数再提取欧拉角，
+        # 倒飞时的 phi+k*pi 分支会被折叠到主值范围，导致 Omega_ref 与 q_ref 不一致。
+        _, _, phi_ref, theta_bar_ref = att_flat.compute_desired_attitude_and_thrust(
+            f_ref_i,
+            v_ref,
+            delta_sum,
+            psi_ref,
+            q_curr,
+            return_angles=True,
+        )
         omega_ref = att_flat.compute_feedforward_angular_velocity(
             v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_ref_i, phi_ref, theta_bar_ref, delta_sum
         )
@@ -221,7 +232,7 @@ def main():
         delta_flaps = alpha_act * delta_cmd + (1 - alpha_act) * delta_flaps
         
         # 7. 物理环境计算真实的受力与力矩
-        f_alpha_real, m_body_real, f_delta_alpha_real = aero.compute_forces_and_moments(
+        f_alpha_real, m_body_real, _ = aero.compute_forces_and_moments(
             v_b, omega_rotors[0], omega_rotors[1], delta_flaps[0], delta_flaps[1]
         )
         
@@ -237,26 +248,52 @@ def main():
                 state[5] = 0.0
         
         # 9. 更新 INDI 滤波器状态 (在实际代码中来自传感器)
-        alpha_lpf = 0.35   # 主低通滤波系数 (~15Hz 等效)
-        alpha_hpf = 0.06   # 慢变低通系数 (~1Hz), 用于构造带通
+        alpha_lpf = 0.35   # 主低通滤波系数（100 Hz 下离散 -3 dB 约 7 Hz）
+        alpha_slow = 0.06  # 慢变低通系数（约 1 Hz），用于构造舵面带通分量
 
         # (a) 世界系实际加速度 (= v_dot, 已含重力, 对应论文 a_lpf)
         a_real_i = state_dot[3:6]
         a_lpf = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf
 
-        # (b) 瞬态襟翼加速度修正 (论文 Eq 43):
+        # (b) 对执行器测量施加与 IMU 主低通相匹配的滤波，再从舵面低通量中
+        #     分离慢变分量与带通瞬态分量。
+        omega_rotors_lpf = alpha_lpf * omega_rotors + (1 - alpha_lpf) * omega_rotors_lpf
+        delta_flaps_lpf = alpha_lpf * delta_flaps + (1 - alpha_lpf) * delta_flaps_lpf
+        delta_flaps_slow = alpha_slow * delta_flaps_lpf + (1 - alpha_slow) * delta_flaps_slow
+        delta_flaps_hpf = delta_flaps_lpf - delta_flaps_slow
+
+        # Eq. (46) 的 f_lpf 必须使用“不含瞬态”的舵面分量；角加速度 INDI
+        # 则使用普通低通舵面分量。二者均由滤波后的执行器测量重新计算，
+        # 而不是直接低通仿真环境给出的真实合力/力矩。
+        f_alpha_lpf, _, _ = aero.compute_forces_and_moments(
+            v_b,
+            omega_rotors_lpf[0],
+            omega_rotors_lpf[1],
+            delta_flaps_slow[0],
+            delta_flaps_slow[1],
+        )
+        _, m_lpf, _ = aero.compute_forces_and_moments(
+            v_b,
+            omega_rotors_lpf[0],
+            omega_rotors_lpf[1],
+            delta_flaps_lpf[0],
+            delta_flaps_lpf[1],
+        )
+        _, _, f_delta_hpf = aero.compute_forces_and_moments(
+            v_b,
+            omega_rotors_lpf[0],
+            omega_rotors_lpf[1],
+            delta_flaps_hpf[0],
+            delta_flaps_hpf[1],
+        )
+
+        # (c) 瞬态襟翼加速度修正 (论文 Eq. 43):
         #     a_tilde_lpf = a_lpf - m^-1 * R_alpha^i * f_delta_hpf^alpha
-        #     带通提取襟翼力瞬态分量: 先与主低通同相(LP), 再减去其慢变(<~1Hz)分量(HP)。
         R_alpha_to_i = R_b_to_i @ R_alpha_to_b
-        f_delta_lp = alpha_lpf * f_delta_alpha_real + (1 - alpha_lpf) * f_delta_lp
-        f_delta_slow = alpha_hpf * f_delta_lp + (1 - alpha_hpf) * f_delta_slow
-        f_delta_hpf = f_delta_lp - f_delta_slow
         a_lpf_tilde = a_lpf - (1.0 / cfg.mass) * (R_alpha_to_i @ f_delta_hpf)
 
-        # (c) 其余 INDI 反馈信号
+        # (d) 其余 INDI 反馈信号
         omega_dot_lpf = alpha_lpf * state_dot[10:13] + (1 - alpha_lpf) * omega_dot_lpf
-        f_alpha_lpf = alpha_lpf * f_alpha_real + (1 - alpha_lpf) * f_alpha_lpf
-        m_lpf = alpha_lpf * m_body_real + (1 - alpha_lpf) * m_lpf
         
         # 记录日志
         log_t.append(t)
