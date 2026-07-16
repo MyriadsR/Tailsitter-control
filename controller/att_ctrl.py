@@ -19,7 +19,15 @@ class FlatnessAttitudeController:
         self.c_LV_delta = config.c_LV_delta
         self.c_LT_delta = config.c_LT_delta
 
-    def compute_desired_attitude_and_thrust(self, f_c_i, v_i, delta_sum, psi_ref, q_current):
+    def compute_desired_attitude_and_thrust(
+        self,
+        f_c_i,
+        v_i,
+        delta_sum,
+        psi_ref,
+        q_current,
+        return_angles=False,
+    ):
         r"""
         利用微分平坦变换，从期望受力反解期望姿态和推力 (论文公式 17-23)
         
@@ -28,7 +36,10 @@ class FlatnessAttitudeController:
         :param delta_sum: 左右襟翼偏角之和 \delta_1 + \delta_2 (rad)
         :param psi_ref: 期望偏航角 (rad)
         :param q_current: 当前姿态四元数 (w, x, y, z)
-        :return: q_c (期望姿态四元数), T_c (期望总推力)
+        :param return_angles: 为 True 时，同时返回平坦性变换直接选取的
+            phi 和 theta_bar。全局 k*pi 分支不能通过四元数主值欧拉角提取可靠恢复。
+        :return: 默认返回 q_c, T_c；return_angles=True 时返回
+            q_c, T_c, phi, theta_bar
         """
         v_norm = np.linalg.norm(v_i)
         
@@ -187,6 +198,8 @@ class FlatnessAttitudeController:
         # 使用工具函数将 ZXY 欧拉角 (psi, phi, theta) 转换为四元数
         q_c = zxy_euler_to_quaternion(psi_ref, phi, theta)
         
+        if return_angles:
+            return q_c, T_c, phi, theta_bar
         return q_c, T_c
     
     def compute_feedforward_angular_velocity(self, v_ref, a_ref, j_ref, psi_ref, psi_dot_ref, f_i, phi, theta_bar, delta_sum):
