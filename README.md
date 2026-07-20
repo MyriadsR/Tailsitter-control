@@ -1,35 +1,316 @@
-<!--
- * @Author: xzr && zhenrxu@qq.com
- * @Date: 2026-03-19 19:50:07
- * @LastEditors: xzr && zhenrxu@qq.com
- * @LastEditTime: 2026-04-08 09:59:00
- * @FilePath: /Tailsitter_ws/README.md
- * @Description: 尾座无人机控制
- * 
- * Copyright (c) 2026 by zhenrxu@qq.com, All Rights Reserved. 
--->
-1. 代码结构组成：
-```
-Tailsitter_ws/
+# Tailsitter-control
+
+基于论文全局微分平坦变换与增量非线性动态逆（INDI）的飞翼尾座无人机闭环仿真项目。项目包含六自由度刚体动力学、φ-theory 气动力模型、位置与姿态控制、控制分配、论文试验轨迹、三维姿态动画以及 Fig. 6～Fig. 11 风格的结果绘图程序。
+
+## 1. 项目结构
+
+```text
+Tailsitter-control/
+├── main_sim.py                    # 闭环仿真入口、执行器动态、INDI 滤波与日志保存
+├── config.py                      # 质量、惯量、几何、气动、执行器和控制增益
+├── animate_flight.py              # 位置与姿态的三维动画
+├── setup_vtol_sim_env.sh          # Conda 环境创建/更新脚本
 │
-├── main_sim.py           # 仿真主程序：设置初始状态，运行仿真循环
-├── config.py             # 参数配置：质量、转动惯量、气动导数、电机拟合系数等
+├── controller/
+│   ├── pos_ctrl.py                # 位置/速度 PD，论文 Eq. (41)
+│   ├── INDI_acc_ctrl.py           # 线加速度 INDI，论文 Eq. (46)
+│   ├── att_ctrl.py                # 平坦性姿态解算、角速度前馈、姿态 PD、角 INDI
+│   └── actuator_ctrl.py           # 推力/力矩到双电机和双舵面的控制分配
 │
-├── environment/          # 物理世界（受力与运动学）
-│   ├── dynamics.py       # 6自由度刚体动力学 (6-DOF Kinematics & Dynamics)
-│   └── aerodynamics.py   # 气动力模型：计算阻力、升力、襟翼带来的弯度变化效应等
+├── environment/
+│   ├── aerodynamics.py            # φ-theory 合力、力矩及瞬态舵面力
+│   └── dynamics.py                # 四元数六自由度刚体动力学
 │
-├── controller/           # 飞控算法
-│   ├── position_ctrl.py  # 外环控制器：计算期望受力向量
-│   ├── attitude_ctrl.py  # 内环姿态控制器：包含解算俯仰角和推力的公式 (19)-(23)
-│   └── motor_ctrl.py     # 底层电机控制：包含前馈+积分的转速控制律公式
+├── trajectory/
+│   ├── __init__.py
+│   └── test.py                    # 分段轨迹及论文 Sec. VI-B～VI-F 轨迹
 │
-└── utils/                # 工具函数
-    ├── math_utils.py     # 数学工具：限制幅值(saturation)、带有保护的 atan2 等
-    └── plotter.py        # 绘图脚本：可视化结果
+├── utils/
+│   └── math_help.py               # ZXY 欧拉角到四元数等数学工具
+│
+├── results/
+│   ├── Lemniscate/                # Fig. 6 风格绘图
+│   ├── KnifeEdgeTrasition/        # Fig. 7 风格绘图（目录名沿用现有拼写）
+│   ├── CircleFlight/              # Fig. 8、Fig. 9 风格绘图
+│   ├── CircleTransition/          # Fig. 10 风格绘图
+│   └── DifferentialThrustTurn/    # Fig. 11 风格绘图
+│
+├── paper/                         # 论文解析文本、页面结构和图片（Git 忽略）
+├── study.md                       # 论文公式、坐标变换和控制逻辑学习笔记
+├── log.md                         # 主要问题、修改内容及验证记录
+├── validation_logs/               # 各轨迹 NPZ 日志（运行后生成，Git 忽略）
+└── trajectory_animations/         # GIF/MP4 动画（运行后生成，Git 忽略）
 ```
 
-2. 需要用到的 python = 3.12.12 包：
-   - numpy
-   - scipy
-   - matplotlib
+## 2. 控制与仿真流程
+
+```text
+参考位置、速度、加速度、jerk、yaw
+                  ↓
+      位置/速度 PD（Eq. 41）
+                  ↓
+       线加速度 INDI（Eq. 46）
+                  ↓
+  全局微分平坦变换：期望姿态和总推力
+                  ↓
+ 姿态 PD + jerk 角速度前馈（Eq. 35、49）
+                  ↓
+       角加速度 INDI（Eq. 52）
+                  ↓
+    双电机/双舵面控制分配（Eq. 37～40）
+                  ↓
+       电机与舵机执行器动态
+                  ↓
+      气动力模型 + 六自由度动力学
+                  ↓
+     加速度、角加速度和执行器滤波反馈
+```
+
+仿真控制频率为 `100 Hz`，状态使用四元数积分，积分器为固定步长 RK4。
+
+## 3. 坐标与数据约定
+
+- 世界坐标系采用 NED：`X` 向北/前、`Y` 向东/右、`Z` 向下。
+- 三维动画和结果图为了直观显示高度，将 `z_NED` 取负，显示为 North-East-Up。
+- 四元数顺序为 `[qw, qx, qy, qz]`，表示机体系到世界系的旋转。
+- 欧拉角采用 ZXY 顺序 `[psi, phi, theta]`，日志中的单位为度。
+- 电机转速单位为 `rad/s`，日志中的舵面偏角单位为度。
+- 动画中红、绿、蓝轴分别表示机体 `b_x`、`b_y`、`b_z`。
+
+ZXY 欧拉角在奇异姿态附近可能跳变，它主要用于绘图；控制器内部姿态使用四元数。
+
+## 4. 环境安装
+
+推荐使用项目脚本创建 Python 3.12.12 环境：
+
+```bash
+cd /home/zr/Tailsitter-control
+bash setup_vtol_sim_env.sh
+conda activate vtol_sim
+```
+
+脚本安装以下依赖：
+
+- NumPy
+- SciPy
+- Matplotlib
+
+也可以指定环境名或重新创建环境：
+
+```bash
+bash setup_vtol_sim_env.sh --name vtol_sim --python 3.12.12
+bash setup_vtol_sim_env.sh --name vtol_sim --python 3.12.12 --recreate
+```
+
+## 5. 快速运行
+
+基础分段轨迹依次完成起飞、悬停、向前移动、悬停、向右移动和悬停：
+
+```bash
+cd /home/zr/Tailsitter-control
+conda activate vtol_sim
+python main_sim.py --trajectory segments
+```
+
+默认会打开位置、ZXY 欧拉角和执行器时序图，并把日志保存为 `flight_log.npz`。无图形界面运行时建议使用：
+
+```bash
+python main_sim.py --trajectory segments \
+  --log flight_log_segments.npz --no-show
+```
+
+查看完整参数：
+
+```bash
+python main_sim.py --help
+```
+
+## 6. 运行论文轨迹
+
+先创建日志目录：
+
+```bash
+mkdir -p validation_logs
+```
+
+分别运行各轨迹：
+
+```bash
+# Sec. VI-B：Bernoulli Lemniscate
+python main_sim.py --trajectory lemniscate \
+  --log validation_logs/lemniscate.npz --no-show
+
+# Sec. VI-C：椭圆跑道上的 knife-edge/coordinated 转换
+python main_sim.py --trajectory knife-edge-transition \
+  --log validation_logs/knife-edge-transition.npz --no-show
+
+# Sec. VI-D：协调圆周飞行
+python main_sim.py --trajectory circle-coordinated \
+  --log validation_logs/circle-coordinated.npz --no-show
+
+# Sec. VI-D：定常刀锋圆周飞行
+python main_sim.py --trajectory circular-knife-edge \
+  --log validation_logs/circular-knife-edge.npz --no-show
+
+# Sec. VI-E：圆周上从悬停过渡到协调前飞
+python main_sim.py --trajectory transition-to-forward \
+  --log validation_logs/transition-to-forward.npz --no-show
+
+# Sec. VI-E：圆周上从协调前飞过渡到悬停
+python main_sim.py --trajectory transition-to-hover \
+  --log validation_logs/transition-to-hover.npz --no-show
+
+# Sec. VI-F：差分推力快速掉头
+python main_sim.py --trajectory differential-turn \
+  --log validation_logs/differential-turn.npz --no-show
+```
+
+当前可选轨迹如下：
+
+| 命令名称 | 轨迹类 | 默认参数 |
+|---|---|---|
+| `segments` | `TrajectoryGenerator` | 高度 10 m，前移 10 m，右移 10 m |
+| `lemniscate` | `LemniscateTrajectory` | 6 m/s，7 s/圈，8 圈 |
+| `knife-edge-transition` | `KnifeEdgeTransitionTrajectory` | 6 m/s，6.25 s/圈，8 圈 |
+| `circle-coordinated` | `CircularTrajectory` | 半径 3.5 m，8.1 m/s，4 圈，协调飞行 |
+| `circular-knife-edge` | `CircularTrajectory` | 半径 3.5 m，8.1 m/s，4 圈，刀锋飞行 |
+| `transition-to-forward` | `CircularTransitionTrajectory` | 3 s 内从 0 加速至 8.1 m/s |
+| `transition-to-hover` | `CircularTransitionTrajectory` | 3 s 内从 8.1 m/s 减速至 0 |
+| `differential-turn` | `DifferentialThrustTurnTrajectory` | 7 m/s，0.52 s 完成 π yaw 旋转 |
+
+`circle-knife-edge` 是兼容旧命令的别名，实际等价于 Sec. VI-C 的 `knife-edge-transition`。Sec. VI-D 的全程刀锋圆周应使用 `circular-knife-edge`。
+
+### 覆盖轨迹参数
+
+```bash
+# 修改闭合轨迹圈数和速度
+python main_sim.py --trajectory circle-coordinated \
+  --speed 7.8 --laps 2 \
+  --log validation_logs/circle-coordinated.npz --no-show
+
+# 修改 Lemniscate 的速度、单圈时间和圈数
+python main_sim.py --trajectory lemniscate \
+  --speed 6.0 --lap-time 7.0 --laps 8 \
+  --log validation_logs/lemniscate.npz --no-show
+
+# 修改椭圆过渡轨迹
+python main_sim.py --trajectory knife-edge-transition \
+  --speed 6.0 --lap-time 6.25 --laps 8 \
+  --log validation_logs/knife-edge-transition.npz --no-show
+```
+
+参数适用范围：
+
+- `--laps`：Lemniscate、椭圆过渡和两种定常圆周轨迹；
+- `--lap-time`：Lemniscate 与椭圆过渡轨迹；
+- `--speed`：除 `segments` 外的轨迹。对圆周过渡，它表示 3 s 过渡结束时的目标速度。
+
+## 7. NPZ 日志
+
+`main_sim.py` 保存的主要字段包括：
+
+| 字段 | 含义 |
+|---|---|
+| `time` | 时间 |
+| `position`, `velocity`, `acceleration` | NED 实际平动状态 |
+| `position_ref`, `velocity_ref`, `acceleration_ref` | 参考轨迹及其导数 |
+| `psi_ref` | 参考偏航角 |
+| `euler_deg`, `euler_command_deg` | 实际和指令 ZXY 欧拉角 |
+| `angular_velocity`, `angular_velocity_ref` | 实际和参考机体角速度 |
+| `angular_acceleration` | 未滤波机体角加速度 |
+| `angular_acceleration_lpf` | 角 INDI 使用的滤波角加速度 |
+| `angular_acceleration_command` | 指令角加速度 |
+| `rotor_speed` | 两个电机的实际转速 |
+| `flap_deg` | 两个舵面的实际偏角 |
+| `coordinate_frame`, `euler_sequence` | 坐标系和欧拉角顺序元数据 |
+
+每个轨迹应使用独立日志文件，避免默认 `flight_log.npz` 被下一次仿真覆盖。
+
+## 8. 三维飞行动画
+
+在生成对应日志后，可按预设轨迹直接播放：
+
+```bash
+python animate_flight.py --trajectory lemniscate
+python animate_flight.py --trajectory knife-edge-transition
+python animate_flight.py --trajectory circle-coordinated
+python animate_flight.py --trajectory circular-knife-edge
+python animate_flight.py --trajectory transition-to-forward
+python animate_flight.py --trajectory transition-to-hover
+python animate_flight.py --trajectory differential-turn
+```
+
+也可以指定任意日志：
+
+```bash
+python animate_flight.py validation_logs/lemniscate.npz
+python animate_flight.py validation_logs/circle-coordinated.npz \
+  --stride 10 --speed 1.5 --axis-length 1.2
+```
+
+保存 GIF 或 MP4：
+
+```bash
+python animate_flight.py validation_logs/lemniscate.npz \
+  --save trajectory_animations/lemniscate.gif --no-show
+
+python animate_flight.py validation_logs/lemniscate.npz \
+  --save trajectory_animations/lemniscate.mp4 --no-show
+```
+
+批量导出七种论文轨迹动画：
+
+```bash
+python animate_flight.py --all-trajectories \
+  --output-dir trajectory_animations --format gif --no-show
+```
+
+MP4 导出需要系统安装 FFmpeg。完整参数可通过 `python animate_flight.py --help` 查看。
+
+## 9. 生成论文风格结果图
+
+以下程序默认读取 `validation_logs/` 中对应名称的日志，并把图片保存到各自目录。
+
+```bash
+# Fig. 6：Lemniscate
+python results/Lemniscate/plot_lemniscate_results.py
+
+# Fig. 7：Knife-edge transitioning
+python results/KnifeEdgeTrasition/plot_knife_edge_transition_results.py
+
+# Fig. 8：协调/刀锋圆周的位置、误差、速度、加速度和姿态
+python results/CircleFlight/plot_circle_flight_results.py
+
+# Fig. 9：协调/刀锋圆周的电机、舵面和三轴角加速度
+python results/CircleFlight/plot_circle_flight_actuators.py
+
+# Fig. 10：悬停与协调前飞之间的双向圆周过渡
+python results/CircleTransition/plot_circle_transition_results.py
+
+# Fig. 11：差分推力掉头
+python results/DifferentialThrustTurn/plot_differential_thrust_turn_results.py
+```
+
+结果脚本默认只保存图片；附加 `--show` 可同时打开窗口，使用 `--output` 可指定 PNG 或 PDF。例如：
+
+```bash
+python results/Lemniscate/plot_lemniscate_results.py \
+  --lap 6 --output results/Lemniscate/lemniscate_lap6.pdf --show
+```
+
+每个结果目录中的 `README.md` 记录了对应子图、时间窗口和专用参数。
+
+## 10. 参数与复现范围
+
+`config.py` 中部分参数来自论文，部分参数根据论文图表、飞行器尺寸和执行器信息估算。论文没有公开所有台架数据、惯量、几何臂长及原始轨迹解析式，因此本项目不是作者飞行代码和参数的逐字复制。
+
+其中：
+
+- Lemniscate 根据论文给出的速度、圈时和圈数实现；
+- knife-edge transitioning 椭圆依据论文 Sec. VI-C、Fig. 7 和给出的载荷信息重建；
+- differential-thrust turn 根据 7 m/s、约 0.5 s 朝向反转和约 650 deg/s 最大角速度重建；
+- 当前仿真为 100 Hz，一阶 INDI 信号滤波；论文实验使用更高控制频率和二阶 Butterworth 滤波器。
+
+因此，结果适合检查论文控制逻辑、坐标变换、执行器作用和轨迹跟踪趋势，不应将数值结果视为论文实验数据的完全复现。
+
+更详细的公式核对和问题解释见 `study.md`，代码修改与验证记录见 `log.md`。
