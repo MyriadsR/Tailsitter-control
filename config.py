@@ -41,6 +41,14 @@ class TailsitterConfig:
         self.delta_max = 1.0             # Fig. 11 中接近满舵的约 +/-1 rad
         self.servo_time_constant = 0.03  # MKS HV93i 响应量级 (s)
         self.servo_rate_max = 25.0       # 考虑气动负载后的舵面速率限制 (rad/s)
+
+        # === 控制与传感器滤波（论文 Sec. VI.A）===
+        # 论文实验在 2000 Hz 下更新控制器。为兼顾仿真速度，当前数值仿真
+        # 使用 500 Hz；滤波器仍保持论文的阶数和截止频率，并根据该采样率
+        # 重新设计数字系数。
+        self.control_rate_hz = 500.0
+        self.indi_lpf_cutoff_hz = 15.0
+        self.flap_hpf_cutoff_hz = 1.0
         
         # === alpha-theory 气动参数 (基于论文 Table 2 实验测量值) ===
         self.c_LV = 0.29     # 机翼升力系数 [cite: 670]
@@ -78,13 +86,13 @@ class TailsitterConfig:
 
         # === 内环姿态 PD 控制器增益 ===
         # 滚转轴 (Roll - 靠副翼/差动舵面)
-        self.k_xi_roll = 40.0
-        self.k_omega_roll = 10.0
+        self.k_xi_roll = 78.4
+        self.k_omega_roll = 14.0
         
         # 俯仰轴 (Pitch - 靠升降舵，受空速影响，响应略慢)
-        self.k_xi_pitch = 28.0
-        self.k_omega_pitch = 7.0
+        self.k_xi_pitch = 54.88
+        self.k_omega_pitch = 9.8
         
         # 偏航轴 (Yaw - 靠差速推力，响应极快)
-        self.k_xi_yaw = 28.0
-        self.k_omega_yaw = 7.0
+        self.k_xi_yaw = 54.88
+        self.k_omega_yaw = 9.8
