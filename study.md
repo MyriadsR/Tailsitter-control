@@ -1541,47 +1541,38 @@ log_flaps.append(delta_flaps.copy())
                        期望力矩 m_c
 ```
 
-## 6.1 一阶低通滤波器是什么意思
+## 6.1 二阶 Butterworth 滤波器是什么意思
 
-代码使用如下递推式：
-
-$$
-y_k=\alpha x_k+(1-\alpha)y_{k-1}
-$$
-
-其中：
-
-- $x_k$ 是当前新测量；
-- $y_{k-1}$ 是上一时刻的滤波结果；
-- $y_k$ 是当前滤波结果；
-- $\alpha$ 越大，越相信新测量，响应越快，但抑制噪声越弱；
-- $\alpha$ 越小，越依赖历史值，曲线更平滑，但延迟更大。
-
-其离散传递函数为：
+当前代码按照论文 Sec. VI.A 使用二阶数字 Butterworth 滤波器。归一化后的二阶离散滤波器可写为：
 
 $$
-H(z)=\frac{\alpha}{1-(1-\alpha)z^{-1}}
+y_k=b_0x_k+b_1x_{k-1}+b_2x_{k-2}-a_1y_{k-1}-a_2y_{k-2}
 $$
 
-若用一阶连续低通近似，则等效时间常数和截止频率约为：
+与原来只保存一个历史状态的一阶指数滤波相比，二阶滤波器具有两个极点，截止频率之后的滚降更快。Butterworth 的特点是通带内幅值响应最大平坦，二阶低通的连续原型幅值满足：
 
 $$
-\tau=-\frac{\Delta t}{\ln(1-\alpha)},\qquad
-f_c\approx\frac{1}{2\pi\tau}
+|H_{\mathrm{LP}}(j2\pi f)|
+=
+\frac{1}{\sqrt{1+(f/f_c)^4}}
 $$
 
-在当前 $100\ \mathrm{Hz}$ 仿真中，$\Delta t=0.01\ \mathrm{s}$：
-
-- `alpha_lpf = 0.35` 对应 $\tau\approx0.0232\ \mathrm{s}$，截止频率约 $6.9\ \mathrm{Hz}$；
-- `alpha_slow = 0.06` 对应 $\tau\approx0.1616\ \mathrm{s}$，截止频率约 $1.0\ \mathrm{Hz}$。
-
-因此主低通保留大约 $7\ \mathrm{Hz}$ 以下的控制相关运动，而慢低通主要保留约 $1\ \mathrm{Hz}$ 以下的舵面稳态或缓慢变化。
-
-必须注意，$\alpha$ 与采样周期绑定。如果以后修改 `dt`，却仍固定使用 `0.35` 和 `0.06`，实际截止频率也会随之改变。若希望保持截止频率不变，应按下式重新计算：
+因此在 $f=f_c$ 时：
 
 $$
-\alpha=1-e^{-2\pi f_c\Delta t}
+20\log_{10}|H|=-3.0103\ \mathrm{dB}
 $$
+
+论文公开的实机频率与当前仿真配置分别为：
+
+$$
+f_{s,\mathrm{paper}}=2000\ \mathrm{Hz},\qquad
+f_{s,\mathrm{sim}}=500\ \mathrm{Hz},\qquad
+f_{c,\mathrm{LP}}=15\ \mathrm{Hz},\qquad
+f_{c,\mathrm{HP}}=1\ \mathrm{Hz}
+$$
+
+为缩短仿真时间，控制与滤波更新率暂时使用 $500\ \mathrm{Hz}$。数字滤波器系数通过 `scipy.signal.butter(..., fs=500, output="sos")` 重新设计，并以二阶节的转置直接二型结构逐采样更新。`utils/filters.py` 对所有通道复用同一组系数，从而保证 IMU、电机转速和舵面测量具有一致的幅频与相频响应。
 
 ## 6.2 加速度低通 `a_lpf`
 
@@ -1589,7 +1580,7 @@ $$
 
 ```python
 a_real_i = state_dot[3:6]
-a_lpf = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf
+a_lpf = acceleration_lpf_filter.update(a_real_i)
 ```
 
 `state_dot[3:6]` 是世界 NED 坐标系中的速度导数：
@@ -1628,14 +1619,8 @@ $$
 代码为：
 
 ```python
-omega_rotors_lpf = (
-    alpha_lpf * omega_rotors
-    + (1 - alpha_lpf) * omega_rotors_lpf
-)
-delta_flaps_lpf = (
-    alpha_lpf * delta_flaps
-    + (1 - alpha_lpf) * delta_flaps_lpf
-)
+omega_rotors_lpf = rotor_lpf_filter.update(omega_rotors)
+delta_flaps_lpf = flap_lpf_filter.update(delta_flaps)
 ```
 
 电机转速和舵面角本身通常比 IMU 加速度干净，但论文仍要求对它们使用与 IMU 相同的低通滤波器。原因是 INDI 不是单独观察某一个信号，而是在同一时刻比较：
@@ -1669,16 +1654,13 @@ $$
 
 等号两边的量必须代表近似相同时间尺度上的飞行器响应。
 
-## 6.4 舵面为什么还要分成慢变分量和瞬态分量
+## 6.4 舵面为什么还要分成去瞬态分量和瞬态分量
 
-主低通后的舵面量继续经过慢低通：
+主低通后的舵面量继续经过论文规定的 $1\ \mathrm{Hz}$ 二阶 Butterworth 高通：
 
 ```python
-delta_flaps_slow = (
-    alpha_slow * delta_flaps_lpf
-    + (1 - alpha_slow) * delta_flaps_slow
-)
-delta_flaps_hpf = delta_flaps_lpf - delta_flaps_slow
+delta_flaps_hpf = flap_hpf_filter.update(delta_flaps_lpf)
+delta_flaps_without_transient = delta_flaps_lpf - delta_flaps_hpf
 ```
 
 定义：
@@ -1690,39 +1672,37 @@ H_{\mathrm{main}}\delta
 $$
 
 $$
-\delta_{\mathrm{slow}}
-=
-H_{\mathrm{slow}}\delta_{\mathrm{lpf}}
-$$
-
-$$
 \delta_{\mathrm{hpf}}
 =
-\delta_{\mathrm{lpf}}-\delta_{\mathrm{slow}}
-=
-(1-H_{\mathrm{slow}})H_{\mathrm{main}}\delta
+H_{\mathrm{HP},1\mathrm{Hz}}\delta_{\mathrm{lpf}}
 $$
 
-所以代码中的 `delta_flaps_hpf` 并不是原始舵面信号的纯高通，而是：
+$$
+\delta_{\mathrm{without\ transient}}
+=
+\delta_{\mathrm{lpf}}-\delta_{\mathrm{hpf}}
+$$
 
-1. 先由约 $7\ \mathrm{Hz}$ 的主低通去掉高频噪声；
-2. 再减去约 $1\ \mathrm{Hz}$ 以下的慢变分量。
+所以 `delta_flaps_hpf` 相对于原始舵面信号经历了两级滤波：
 
-因此它实际是大约 $1$ 到 $7\ \mathrm{Hz}$ 之间的带通瞬态舵面分量。变量名中的 `hpf` 表示它相对于 `delta_flaps_lpf` 去除了低频部分。
+1. 先由 $15\ \mathrm{Hz}$ 二阶主低通去掉高频测量噪声并匹配 IMU 相位；
+2. 再由 $1\ \mathrm{Hz}$ 二阶高通去掉配平和缓慢变化部分。
+
+因此从原始舵面输入看，它实际是大约 $1$ 到 $15\ \mathrm{Hz}$ 的带通瞬态分量。这里不能再用一阶滤波中的 `lpf - slow_lpf` 代替，因为二阶高通具有不同的相位和幅值响应。
 
 两部分满足严格的代数分解：
 
 $$
 \delta_{\mathrm{lpf}}
 =
-\delta_{\mathrm{slow}}
+\delta_{\mathrm{without\ transient}}
 +
 \delta_{\mathrm{hpf}}
 $$
 
 其物理含义为：
 
-- $\delta_{\mathrm{slow}}$：配平舵角、缓慢机动所需舵角等准稳态部分；
+- $\delta_{\mathrm{without\ transient}}$：从主低通舵角中扣除高通瞬态后的分量；
 - $\delta_{\mathrm{hpf}}$：快速打舵、回舵及舵面振荡等瞬态部分。
 
 ## 6.5 舵面的非最小相位加速度响应
@@ -1747,15 +1727,15 @@ f_alpha_lpf, _, _ = aero.compute_forces_and_moments(
     v_b,
     omega_rotors_lpf[0],
     omega_rotors_lpf[1],
-    delta_flaps_slow[0],
-    delta_flaps_slow[1],
+    delta_flaps_without_transient[0],
+    delta_flaps_without_transient[1],
 )
 ```
 
 这里使用：
 
 - 主低通后的电机转速；
-- 去除瞬态后的慢变舵面偏角；
+- 去除高通瞬态后的舵面偏角；
 - 当前机体系速度 `v_b`。
 
 得到的 `f_alpha_lpf` 是零升力坐标系 $\alpha$ 下的低频模型合力：
@@ -1766,12 +1746,12 @@ $$
 \pmb f^\alpha
 \left(
 \omega_{\mathrm{lpf}},
-\delta_{\mathrm{slow}},
+\delta_{\mathrm{without\ transient}},
 \pmb v
 \right)
 $$
 
-它包含低频推力、机翼力和慢变舵面力，但不包含 `delta_flaps_hpf` 对应的快速舵面力。
+它包含低频推力、机翼力和去除瞬态后的舵面力，但不包含 `delta_flaps_hpf` 对应的快速舵面力。
 
 ### 6.6.2 角加速度 INDI 的模型力矩
 
@@ -1817,12 +1797,12 @@ $$
 $$
 \pmb f_\delta^\alpha(\delta_{\mathrm{lpf}})
 =
-\pmb f_\delta^\alpha(\delta_{\mathrm{slow}})
+\pmb f_\delta^\alpha(\delta_{\mathrm{without\ transient}})
 +
 \pmb f_\delta^\alpha(\delta_{\mathrm{hpf}})
 $$
 
-这使慢变力与瞬态力的分离在当前模型内保持自洽。
+这使去瞬态力与瞬态力的分离在当前模型内保持自洽。
 
 ## 6.7 Eq. (43) 如何修正加速度
 
@@ -1871,7 +1851,7 @@ $\tilde{\pmb a}_{\mathrm{lpf}}$ 可以理解为：
 
 它不是新的传感器测量，而是“滤波后的 IMU 加速度减去模型预测的舵面瞬态加速度”。
 
-## 6.8 为什么 `a_lpf_tilde` 必须与使用慢变舵面的 `f_alpha_lpf` 配对
+## 6.8 为什么 `a_lpf_tilde` 必须与使用去瞬态舵面的 `f_alpha_lpf` 配对
 
 设滤波后的实际加速度近似为：
 
@@ -1884,7 +1864,7 @@ g\pmb i_z
 \left[
 \pmb R_\alpha^i
 \left(
-\pmb f_{\mathrm{slow}}^\alpha
+\pmb f_{\mathrm{without\ transient}}^\alpha
 +
 \pmb f_{\delta_{\mathrm{hpf}}}^\alpha
 \right)
@@ -1903,13 +1883,13 @@ g\pmb i_z
 \frac{1}{m}
 \left(
 \pmb R_\alpha^i
-\pmb f_{\mathrm{slow}}^\alpha
+\pmb f_{\mathrm{without\ transient}}^\alpha
 +
 \pmb f_{\mathrm{ext}}^i
 \right)
 $$
 
-此时 Eq. (44) 用慢变模型力估计外力：
+此时 Eq. (44) 用去瞬态模型力估计外力：
 
 $$
 \hat{\pmb f}_{\mathrm{ext}}^i
@@ -1927,7 +1907,7 @@ $$
 $$
 \pmb f_{\mathrm{lpf}}^\alpha
 \approx
-\pmb f_{\mathrm{slow}}^\alpha
+\pmb f_{\mathrm{without\ transient}}^\alpha
 $$
 
 就有：
@@ -1955,7 +1935,7 @@ $$
 如果 `a_lpf_tilde` 已经减去了瞬态舵面力，但 `f_alpha_lpf` 仍使用完整的 `delta_flaps_lpf`，那么同一个瞬态分量会在 Eq. (44) 和 Eq. (46) 中出现不一致，控制器会把它误认为外力或额外所需控制力。因此代码必须采用：
 
 ```text
-a_lpf_tilde  ↔  omega_rotors_lpf + delta_flaps_slow
+a_lpf_tilde  ↔  omega_rotors_lpf + delta_flaps_without_transient
 ```
 
 而不能采用：
@@ -1966,16 +1946,15 @@ a_lpf_tilde  ↔  omega_rotors_lpf + delta_flaps_lpf
 
 ## 6.9 角加速度滤波与执行器力矩滤波
 
-代码最后还有：
+代码按照论文先对陀螺仪角速度使用同一个 $15\ \mathrm{Hz}$ 主低通，再进行数值微分：
 
 ```python
-omega_dot_lpf = (
-    alpha_lpf * state_dot[10:13]
-    + (1 - alpha_lpf) * omega_dot_lpf
-)
+omega_lpf_previous = omega_lpf.copy()
+omega_lpf = angular_velocity_lpf_filter.update(omega_curr)
+omega_dot_lpf = (omega_lpf - omega_lpf_previous) / dt
 ```
 
-`state_dot[10:13]` 是机体系角加速度 $\dot{\pmb\Omega}$。低通后得到 $\dot{\pmb\Omega}_{\mathrm{lpf}}$，并在角加速度 INDI 中与 `m_lpf` 配对：
+这样得到论文 Eq. (50) 使用的 $\dot{\pmb\Omega}_{\mathrm{lpf}}$，并在角加速度 INDI 中与 `m_lpf` 配对：
 
 $$
 \pmb m_c
@@ -1998,7 +1977,7 @@ $$
 
 角加速度通道不需要扣除 `f_delta_hpf`，因为舵面快速力矩是姿态内环希望利用的主要控制作用。Eq. (43) 只针对舵面直接线加速度造成的非最小相位问题。
 
-论文实际通过对低通后的陀螺仪角速度数值微分获得 $\dot{\pmb\Omega}_{\mathrm{lpf}}$；仿真中可直接取得动力学模型的真实角加速度，所以当前代码选择先读取 `state_dot[10:13]` 再低通。这避免了数值微分噪声，但比真实传感器链路理想。
+仿真虽然可以直接取得 `state_dot[10:13]`，但控制反馈不再使用这个理想角加速度；它只用于记录未滤波真值。实际角 INDI 反馈严格采用“角速度低通后数值微分”的论文链路。
 
 ## 6.10 滤波更新在控制循环中的时序
 
@@ -2058,7 +2037,7 @@ $$
 
 两者会叠加，但不能互相替代。执行器时间常数描述电机或舵机确实需要多久才能运动到目标值；测量低通描述控制器多久、以多大带宽观察到该运动。
 
-## 6.12 当前仿真与论文实现的差异
+## 6.12 当前仿真与论文滤波实现的对应关系
 
 论文实验使用：
 
@@ -2067,14 +2046,16 @@ $$
 - 对 IMU、电机转速和舵面偏角应用相同主低通；
 - 截止频率 $1\ \mathrm{Hz}$ 的二阶 Butterworth 高通提取瞬态舵面分量。
 
-当前仿真使用：
+当前仿真保留论文的滤波器结构，但降低更新率：
 
-- $100\ \mathrm{Hz}$ 控制频率；
-- `alpha_lpf = 0.35` 的一阶指数低通，截止频率约 $6.9\ \mathrm{Hz}$；
-- `alpha_slow = 0.06` 的一阶慢低通；
-- 用 `delta_flaps_lpf - delta_flaps_slow` 构造约 $1$ 到 $7\ \mathrm{Hz}$ 的带通瞬态分量。
+- $500\ \mathrm{Hz}$ 的控制与滤波更新频率，论文实机为 $2000\ \mathrm{Hz}$；
+- 截止频率 $15\ \mathrm{Hz}$ 的二阶 Butterworth 主低通；
+- IMU 角速度、世界系加速度、电机转速和舵面偏角共用相同主低通设计；
+- 主低通舵面量经过截止频率 $1\ \mathrm{Hz}$ 的二阶 Butterworth 高通；
+- 用 `delta_flaps_lpf - delta_flaps_hpf` 得到 Eq. (46) 使用的不含瞬态舵面分量；
+- 用低通角速度的数值微分获得角加速度 INDI 反馈。
 
-因此当前代码复现了论文的核心结构和信号配对原则，但并非与论文滤波器参数完全相同。尤其是一阶滤波与二阶 Butterworth 的幅频特性、相位延迟和滚降速度不同。若要严格复现实验滤波链，应在当前采样率下重新设计数字二阶 Butterworth 滤波器，而不是只把 `alpha_lpf` 改成某个数值。
+因此当前代码与论文的滤波器阶数和截止频率一致，但控制/滤波更新率不再完全一致。500 Hz 相对于 15 Hz 主截止频率仍有约 33 倍采样裕量，足以实现稳定的数字 Butterworth 滤波；其离散相位和采样延迟仍会与 2000 Hz 实机存在差异。其他实现边界还包括：仿真直接提供无噪声动力学状态，没有进一步模拟具体 IMU 噪声、编码器约 $200\ \mathrm{Hz}$ 的异步采样、模拟舵机电位器噪声和论文固件的 32 位浮点量化。
 
 ## 6.13 最重要的理解
 
@@ -2608,3 +2589,873 @@ $$
 3. 根据最终 $T_1$、$T_2$ 重新计算真实差分推力，供后续力矩分配使用。
 
 这保证了饱和后的控制分配仍然保持代数与物理上的自洽。
+
+
+# 8. Knife-Edge Transition 跟踪变差的原因与调参验证
+
+在增加执行器动态并把飞行器参数改为论文平台参数之后，knife-edge-transition 跟踪变差并不是主要由 `alpha_T=-5 deg` 单独造成的。受控消融表明，主要因素是 `c_mu_T=-0.025 m` 引入的动态俯仰配平负担，以及电机和舵机延迟；两者影响相当且相互耦合。
+
+## 8.1 受控消融结果
+
+使用当前 $500\ \mathrm{Hz}$ 控制与滤波结构，对 knife-edge-transition 运行两圈，得到：
+
+| 配置 | RMS / 最大位置误差 | 相对改善 |
+|---|---:|---:|
+| 当前完整模型 | $0.816/2.422\ \mathrm m$ | — |
+| 仅令 `alpha_T=0` | $0.796/2.347\ \mathrm m$ | RMS 改善约 $2.6\%$ |
+| 仅令 `c_mu_T=0` | $0.613/1.344\ \mathrm m$ | RMS 改善约 $25\%$ |
+| 仅移除执行器动态 | $0.652/1.698\ \mathrm m$ | RMS 改善约 $20\%$ |
+| `alpha_T=c_mu_T=0` 且使用理想执行器 | $0.575/1.232\ \mathrm m$ | RMS 改善约 $30\%$ |
+
+完整八圈的关键结果为：
+
+| 配置 | RMS / 最大位置误差 |
+|---|---:|
+| 当前完整模型 | $0.838/2.520\ \mathrm m$ |
+| `c_mu_T=0` | $0.623/1.344\ \mathrm m$ |
+| 理想执行器 | $0.691/1.863\ \mathrm m$ |
+| 旧安装参数与理想执行器 | $0.589/1.232\ \mathrm m$ |
+
+因此在当前仿真中的影响排序大致是：
+
+1. `c_mu_T` 造成的动态俯仰配平；
+2. 电机和舵机动态延迟；
+3. `alpha_T=-5 deg` 本身。
+
+这些影响并非完全线性叠加，因为执行器延迟、俯仰配平、姿态误差和线加速度误差之间存在闭环耦合。
+
+## 8.2 `alpha_T` 不是动态配平参数
+
+`config.py` 中：
+
+```python
+self.alpha_T = np.deg2rad(-5.0)
+```
+
+表示电机推力轴相对机体系的固定安装角。它会改变：
+
+- 推力在零升力坐标系中的方向；
+- 差分推力产生的力矩映射；
+- 螺旋桨反扭矩的轴向分解；
+- 平坦性变换中的 $\bar\alpha=\alpha_0+\alpha_T$。
+
+但是控制器和仿真气动力模型使用的是同一个 `alpha_T`，所以这里没有产生控制器与被控对象之间的参数不一致。仅将它恢复为零后，位置 RMS 只改善约 $2.6\%$，说明它不是跟踪显著变差的主要原因。
+
+如果实际飞机的安装角确实为 $-5^\circ$，不应该为了得到更好的仿真曲线而将它改成零。否则只是把真实的推力方向耦合从模型中删除。
+
+## 8.3 真正要求配平的是 `c_mu_T`
+
+`config.py` 中：
+
+```python
+self.c_mu_T = -0.025
+```
+
+它产生与总推力成正比的俯仰矩：
+
+$$
+m_{T,y}
+=
+c_{\mu T}(T_1+T_2)
+=
+c_{\mu T}T_c
+$$
+
+该力矩需要两个舵面同向偏转产生相反的俯仰矩。若两个舵面使用相同配平角：
+
+$$
+\delta_1=\delta_2=\delta_{\mathrm{trim}}
+$$
+
+根据当前舵面力模型，近似配平条件为：
+
+$$
+c_{\mu T}T_c
+-
+l_{\delta x}
+\left[
+c_{L_T}^{\delta}\cos\bar\alpha\,T_c
++
+2c_{L_V}^{\delta}\lVert v\rVert v_x^\alpha
+\right]
+\delta_{\mathrm{trim}}
+=
+0
+$$
+
+因此：
+
+$$
+\delta_{\mathrm{trim}}
+=
+\frac{c_{\mu T}T_c}
+{
+l_{\delta x}
+\left[
+c_{L_T}^{\delta}\cos\bar\alpha\,T_c
++
+2c_{L_V}^{\delta}\lVert v\rVert v_x^\alpha
+\right]
+}
+$$
+
+悬停时 $v=0$，代入当前参数：
+
+$$
+\delta_{\mathrm{trim}}
+\approx
+\frac{-0.025}
+{
+0.075\times1.25\times\cos(-7^\circ)
+}
+\approx
+-0.269\ \mathrm{rad}
+$$
+
+这正好约为代码中的 $-0.27\ \mathrm{rad}$ 初始配平舵角，也与论文根据静态悬停配平得到的参数一致。
+
+## 8.4 为什么需要动态配平
+
+飞行过程中：
+
+- 总推力 $T_c$ 不断变化；
+- 空速 $\lVert v\rVert$ 和 $v_x^\alpha$ 不断变化；
+- 轨迹在正飞和倒飞之间交替；
+- 舵面在螺旋桨滑流和自由来流中的效率不断变化。
+
+因此：
+
+$$
+\delta_{\mathrm{trim}}
+=
+\delta_{\mathrm{trim}}
+\left(
+T_c,\lVert v\rVert,v_x^\alpha
+\right)
+$$
+
+配平角不是一个始终固定的 $-0.27\ \mathrm{rad}$。
+
+当前代码并非完全缺少动态配平：
+
+1. 仿真初始化时利用 $c_{\mu T}$、总推力和舵面效率迭代求解初始配平角；
+2. 控制分配器每个控制周期都计算：
+
+   $$
+   \pmb m_{\delta,c}
+   =
+   \pmb m_c
+   -
+   \pmb m_T
+   -
+   \pmb m_\mu
+   $$
+
+3. 其中 $\pmb m_T$ 已包含 $c_{\mu T}T_c$；
+4. 随后控制分配器求出两个舵面应提供的补偿力矩。
+
+所以跟踪变差不是因为代码完全没有考虑 $c_{\mu T}$。真正的问题是：动态配平命令已经计算出来，但电机、舵机和测量滤波器不能瞬时实现该命令。
+
+## 8.5 执行器延迟为什么影响明显
+
+当前模型使用：
+
+- 电机时间常数：$0.04\ \mathrm{s}$；
+- 舵机时间常数：$0.03\ \mathrm{s}$；
+- 舵面最大角速度：$25\ \mathrm{rad/s}$；
+- $15\ \mathrm{Hz}$ 二阶 Butterworth 测量低通。
+
+轨迹的曲率过渡长度为：
+
+$$
+L_{\mathrm{blend}}=0.6\ \mathrm m
+$$
+
+在 $6\ \mathrm{m/s}$ 下，曲率主要变化时间约为：
+
+$$
+t_{\mathrm{blend}}
+=
+\frac{0.6}{6}
+=
+0.1\ \mathrm{s}
+$$
+
+电机和舵机的 $30$～$40\ \mathrm{ms}$ 时间常数已经占这段过程的 $30\%$～$40\%$，再叠加主低通的相位延迟后，控制作用相对参考变化出现明显滞后。
+
+此外，电机和舵面的响应速度不同：
+
+- 总推力变化会改变 $c_{\mu T}T_c$；
+- 舵面必须同步改变才能抵消该俯仰矩；
+- 电机与舵机具有不同时间常数；
+- 舵面快速运动还会产生论文 Eq. (43) 所处理的非最小相位线加速度。
+
+因此即使静态控制分配完全正确，瞬态过程中也可能暂时存在未抵消俯仰矩。
+
+移除执行器动态后，八圈位置 RMS 从 $0.838\ \mathrm m$ 降到 $0.691\ \mathrm m$。两圈数据中：
+
+- 姿态误差 RMS 从约 $19.65^\circ$ 降到 $15.66^\circ$；
+- 三轴角加速度跟踪误差明显降低；
+- 位置 RMS 从 $0.816\ \mathrm m$ 降到 $0.652\ \mathrm m$。
+
+这说明执行器延迟是第二个主要因素。
+
+## 8.6 为什么正飞和倒飞圈误差交替
+
+当前完整模型的八圈位置 RMS 呈现明显交替：
+
+```text
+0.976, 0.616, 1.023, 0.617,
+1.023, 0.617, 1.023, 0.617 m
+```
+
+这是因为 coordinated 段每一圈在正飞和倒飞之间切换。加入 `c_mu_T` 后，俯仰矩配平与当前姿态、舵面力方向和推力方向耦合，导致其中一类姿态分支的跟踪明显更差。
+
+令 `c_mu_T=0` 后，各圈位置 RMS 基本统一为：
+
+```text
+0.604～0.631 m
+```
+
+这进一步说明主要参数因素是推力俯仰矩，而不是单独的 `alpha_T=-5 deg`。
+
+`c_mu_T=0` 后的姿态误差改善相对有限，但速度误差和位置误差明显下降。这说明其主要影响不仅是瞬时姿态误差，还包括舵面配平力对平动力的持续耦合。
+
+## 8.7 当前工况不是首先受到硬饱和限制
+
+当前完整模型在八圈 knife-edge-transition 中达到：
+
+- 最大电机转速约 $2011\ \mathrm{rad/s}$，低于 $2500\ \mathrm{rad/s}$ 上限；
+- 最大舵面偏角约 $45.5^\circ$，低于 $57.3^\circ$ 上限；
+- 最大差分推力约 $4.93\ \mathrm N$。
+
+因此默认增益下跟踪变差并不是首先由硬饱和造成的，主要是动态配平、执行器相位延迟和控制带宽不足。
+
+但提高姿态环增益后，舵面会迅速接近限位，所以硬饱和会成为进一步调参的约束。
+
+## 8.8 姿态环增益扫描
+
+为了判断能否通过调参改善，按照保持近似阻尼比例的方式缩放姿态环：
+
+$$
+K_\xi'=s^2K_\xi,\qquad
+K_\Omega'=sK_\Omega
+$$
+
+两圈扫描结果为：
+
+| 带宽因子 $s$ | RMS / 最大位置误差 | 最大舵偏 | RMS 偏航误差 |
+|---:|---:|---:|---:|
+| $0.6$ | $4.006/8.059\ \mathrm m$ | $30.7^\circ$ | $18.23^\circ$ |
+| $0.8$ | $1.337/3.778\ \mathrm m$ | $36.3^\circ$ | $5.73^\circ$ |
+| $1.0$ | $0.816/2.422\ \mathrm m$ | $45.5^\circ$ | $4.53^\circ$ |
+| $1.2$ | $0.592/1.672\ \mathrm m$ | $49.8^\circ$ | $3.72^\circ$ |
+| $1.4$ | $0.494/1.222\ \mathrm m$ | $51.3^\circ$ | $4.17^\circ$ |
+| $1.6$ | $0.467/0.967\ \mathrm m$ | $54.0^\circ$ | $4.82^\circ$ |
+| $1.8$ | $0.466/0.837\ \mathrm m$ | $56.1^\circ$ | $5.18^\circ$ |
+| $2.0$ | $0.498/0.790\ \mathrm m$ | $56.8^\circ$ | $5.49^\circ$ |
+
+结果表明：
+
+- 默认姿态环带宽偏低；
+- $s=1.2$～$1.4$ 可以明显改善位置和偏航跟踪；
+- $s=1.6$ 以后位置 RMS 改善很小；
+- 更高带宽会增加偏航误差、差分推力和舵面占用；
+- $s=1.8$～$2.0$ 时舵面已经非常接近 $57.3^\circ$ 限位。
+
+完整八圈使用 $s=1.4$ 时：
+
+| 指标 | 当前增益 | $1.4$ 倍带宽 |
+|---|---:|---:|
+| RMS 位置误差 | $0.838\ \mathrm m$ | $0.506\ \mathrm m$ |
+| 最大位置误差 | $2.520\ \mathrm m$ | $1.258\ \mathrm m$ |
+| 最大舵偏 | $45.5^\circ$ | $53.8^\circ$ |
+| 舵面极限 | $57.3^\circ$ | $57.3^\circ$ |
+
+所以调参确实可以显著改善跟踪，但舵面裕量会明显减小。
+
+## 8.9 已验证的候选姿态增益
+
+$s=1.4$ 对应：
+
+```python
+k_xi_roll = 78.4
+k_omega_roll = 14.0
+
+k_xi_pitch = 54.88
+k_omega_pitch = 9.8
+
+k_xi_yaw = 54.88
+k_omega_yaw = 9.8
+```
+
+这是根据当前轨迹验证得到的候选值，并不代表可以直接作为所有轨迹的最终参数。因为最大舵面偏角已达到约 $53.8^\circ$，只剩约 $3.5^\circ$ 机械裕量。
+
+若希望更保守，可以先从 $s=1.2$～$1.3$ 开始，再逐步增加。每次调整都应同时验证：
+
+- knife-edge-transition；
+- coordinated circle；
+- knife-edge circle；
+- 两个圆周过渡；
+- differential-thrust turn；
+- 电机和舵面饱和时间比例；
+- 姿态与角加速度相位裕量。
+
+## 8.10 推荐的改善顺序
+
+### 1. 保留真实的 `alpha_T`
+
+如果目标是复现论文飞行器，应保留：
+
+$$
+\alpha_T=-5^\circ
+$$
+
+把它改为零只能删除真实安装角耦合，消融结果也表明收益很小。
+
+### 2. 重新确认 `c_mu_T`
+
+论文中的：
+
+$$
+c_{\mu T}=-0.025\ \mathrm m
+$$
+
+是根据论文实机悬停时每个舵面约 $-0.27\ \mathrm{rad}$ 的配平角辨识得到的。如果当前仿真中的飞行器几何、舵面效率、推力系数或真实配平角与论文平台不同，就不能直接照搬这个值。
+
+应使用当前平台实际或仿真稳态配平数据重新计算：
+
+$$
+c_{\mu T}
+=
+\delta_{\mathrm{trim}}
+l_{\delta x}
+c_{L_T}^{\delta}
+\cos\bar\alpha
+$$
+
+悬停数据确定后，还应检查前飞状态下同一参数能否给出合理舵面配平。
+
+### 3. 先调姿态内环
+
+建议从 $s=1.2$ 开始，逐步测试到 $s=1.4$，而不是直接使用 $1.8$ 或 $2.0$。内环稳定、快速且仍有执行器裕量后，再调整位置和速度外环。
+
+### 4. 加入执行器动态预测
+
+当前控制分配使用当前时刻的静态逆模型。进一步改善可以采用：
+
+- 根据电机和舵机一阶模型预测下一时刻实际转速与舵角；
+- 根据预测值计算将要实现的力和力矩；
+- 在控制分配中补偿电机与舵机的不同相位；
+- 对动态配平舵角加入适量相位超前或参考预瞄。
+
+这比简单地把时间常数改小更符合真实物理。
+
+### 5. 使用显式动态配平前馈
+
+可以把 $\delta_{\mathrm{trim}}(T_c,v)$ 作为舵面公共偏转的前馈基值，再由角 INDI 只计算增量控制量：
+
+$$
+\delta_i
+=
+\delta_{\mathrm{trim}}(T_c,v)
++
+\Delta\delta_i
+$$
+
+这样姿态反馈不必完全依靠误差出现后再建立配平舵角。
+
+当前控制分配虽然已经隐式包含该关系，但显式分离配平前馈有利于加入执行器预测、速率限制和优先级管理。
+
+### 6. 必要时平滑参考轨迹
+
+若执行器带宽确实不足，可以把曲率融合长度从：
+
+$$
+0.6\ \mathrm m
+$$
+
+增加到约：
+
+$$
+1.0\text{～}1.2\ \mathrm m
+$$
+
+这样可降低曲率和 jerk 的变化速度，但这会改变参考轨迹，只应在真实执行器无法满足原轨迹带宽时采用。
+
+## 8.11 最终判断
+
+`alpha_T=-5 deg` 不是主要问题。它是固定推力安装角，且控制器与动力学模型使用同一数值。
+
+主要参数因素是：
+
+$$
+c_{\mu T}T_c
+$$
+
+产生的推力俯仰矩。它要求舵面进行随总推力和空速变化的动态配平，并进一步产生线加速度耦合。
+
+执行器的 $30$～$40\ \mathrm{ms}$ 一阶延迟以及测量低通相位延迟，是另一个同量级的重要因素。它们使电机推力矩和舵面补偿力矩不能同步建立。
+
+通过姿态环调参可以将八圈位置 RMS 从约 $0.838\ \mathrm m$ 改善到约 $0.506\ \mathrm m$，但同时会明显压缩舵面裕量。若希望进一步接近论文结果，需要同时完成：
+
+1. 基于当前平台重新辨识 $c_{\mu T}$ 和舵面效率；
+2. 调整姿态内环带宽；
+3. 加入执行器动态预测或显式动态配平前馈；
+4. 在所有轨迹上检查执行器饱和与鲁棒性。
+
+为了获得更好曲线而直接令 `alpha_T` 或 `c_mu_T` 为零，并不是论文飞行器的正确复现方式。
+
+
+# 9. 飞行器三轴控制效率比较
+
+不能直接通过 PD 增益大小判断三轴控制效率。PD 增益表示姿态误差要转换成多大的期望角加速度，而真正的控制效率取决于：
+
+$$
+\text{控制效率}
+\sim
+\pmb J^{-1}
+\frac{\partial\pmb m}{\partial\pmb u}
+$$
+
+即执行器单位变化产生的力矩，再除以对应机体轴的转动惯量。
+
+按照当前飞行器参数，主要结论是：
+
+- 机体俯仰轴 $b_y$ 的角加速度效率最高；
+- 机体滚转轴 $b_x$ 次之；
+- 机体偏航轴 $b_z$ 的单位输入效率相对较低，但差分推力的可用范围大，而且不依赖空速；
+- 悬停时若考虑完整执行器范围，俯仰最强，滚转和偏航接近；
+- 前飞速度增加后，舵面效率随空速显著增大，通常变为“俯仰 $>$ 滚转 $>$ 偏航”。
+
+## 9.1 三个机体轴的主要执行器
+
+| 机体轴 | 主要执行器 | 主要控制方式 |
+|---|---|---|
+| $b_x$ 滚转 | 两个舵面 | 差动舵面 |
+| $b_y$ 俯仰 | 两个舵面 | 同向舵面 |
+| $b_z$ 偏航 | 两个电机 | 差分推力 |
+
+这里讨论的是机体系三轴，不是简单按照名称解释 ZXY 欧拉角。
+
+尾座悬停时，ZXY 欧拉角轴与当前机体轴不重合。例如在 $\theta\approx90^\circ$ 附近，欧拉角 $\phi$ 的变化可能主要对应机体 $b_z$ 角速度，因此会主要由电机差速完成。这并不改变机体系中“差动舵面主要产生 $m_x$、同向舵面主要产生 $m_y$、差分推力主要产生 $m_z$”的执行器映射。
+
+## 9.2 当前飞行器惯量
+
+当前惯量为：
+
+$$
+J_x=0.0095,\qquad
+J_y=0.0030,\qquad
+J_z=0.0115
+\quad\mathrm{kg\,m^2}
+$$
+
+俯仰惯量 $J_y$ 明显最小：
+
+$$
+J_y
+\approx0.316J_x
+\approx0.261J_z
+$$
+
+所以即使同向舵面产生的俯仰力矩小于差动舵面产生的滚转力矩，除以较小的 $J_y$ 后，俯仰角加速度仍然可能最大。
+
+## 9.3 悬停总推力工作点
+
+使用当前参数估算悬停总推力：
+
+$$
+T_c\approx6.92\ \mathrm N
+$$
+
+两个电机近似平均分配：
+
+$$
+T_1\approx T_2\approx3.46\ \mathrm N
+$$
+
+下面的局部控制效率均在该工作点附近计算。它表示小范围控制输入变化产生的角加速度变化，不等于任意大输入下的全局响应。
+
+## 9.4 滚转轴：差动舵面
+
+定义差动舵面输入：
+
+$$
+\delta_1=-\delta_d,\qquad
+\delta_2=+\delta_d
+$$
+
+悬停附近的滚转力矩效率约为：
+
+$$
+\frac{\partial m_x}{\partial\delta_d}
+\approx
+1.029\ \mathrm{N\,m/rad}
+$$
+
+除以滚转惯量：
+
+$$
+\frac{\partial\dot p}{\partial\delta_d}
+=
+\frac{1}{J_x}
+\frac{\partial m_x}{\partial\delta_d}
+\approx
+108.4\
+\frac{\mathrm{rad/s^2}}{\mathrm{rad}}
+$$
+
+这里的差动舵面输入约定为一个舵面增加 $\delta_d$、另一个减少 $\delta_d$。如果改用 $\delta_2-\delta_1$ 作为输入变量，数值会相差一个 2 倍比例，因此比较控制效率时必须先统一输入定义。
+
+由于 $\alpha_0$ 不完全为零，差动舵面还会产生一个较小的 $m_z$ 分量，其相对大小约为：
+
+$$
+\frac{m_z}{m_x}
+\approx
+\tan\alpha_0
+$$
+
+当前 $\alpha_0=-2^\circ$，所以该交叉耦合只有约 $-3.5\%$，滚转仍然是主要作用。
+
+## 9.5 俯仰轴：同向舵面
+
+定义同向舵面输入：
+
+$$
+\delta_1=\delta_2=\delta_c
+$$
+
+悬停附近的俯仰力矩效率约为：
+
+$$
+\frac{\partial m_y}{\partial\delta_c}
+\approx
+0.644\ \mathrm{N\,m/rad}
+$$
+
+它小于滚转力矩效率，但俯仰惯量 $J_y$ 很小，因此：
+
+$$
+\frac{\partial\dot q}{\partial\delta_c}
+=
+\frac{1}{J_y}
+\frac{\partial m_y}{\partial\delta_c}
+\approx
+214.6\
+\frac{\mathrm{rad/s^2}}{\mathrm{rad}}
+$$
+
+所以同样改变一弧度舵角时，俯仰角加速度约为滚转角加速度的两倍：
+
+$$
+\frac{
+\partial\dot q/\partial\delta_c
+}{
+\partial\dot p/\partial\delta_d
+}
+\approx1.98
+$$
+
+这说明“俯仰舵面力臂比较短”并不等于“俯仰控制效率最低”。必须同时考虑惯量。
+
+## 9.6 偏航轴：差分推力
+
+定义差分推力：
+
+$$
+\Delta T=T_1-T_2
+$$
+
+当前模型中，差分推力对偏航力矩的效率约为：
+
+$$
+\frac{\partial m_z}{\partial\Delta T}
+\approx
+0.149\ \mathrm m
+$$
+
+因此：
+
+$$
+\frac{\partial\dot r}{\partial\Delta T}
+=
+\frac{1}{J_z}
+\frac{\partial m_z}{\partial\Delta T}
+\approx
+12.96\
+\frac{\mathrm{rad/s^2}}{\mathrm N}
+$$
+
+该数值的单位与舵面效率不同，不能直接把 $12.96$ 与 $108.4$ 或 $214.6$ 比较。必须进一步考虑差分推力的实际可用范围。
+
+悬停总推力约为 $6.92\ \mathrm N$，且当前电机最小推力为零，所以最大差分推力约为：
+
+$$
+|\Delta T|_{\max}
+\approx6.92\ \mathrm N
+$$
+
+对应最大偏航角加速度量级：
+
+$$
+|\dot r|_{\max}
+\approx
+12.96\times6.92
+\approx
+89.7\ \mathrm{rad/s^2}
+$$
+
+差分推力还会产生一定的 $m_x$ 交叉耦合，因为推力安装角、零升力角和螺旋桨反扭矩都不为零。当前控制分配器使用完整力矩模型处理该耦合，而不是假设差分推力只产生纯 $m_z$。
+
+## 9.7 悬停附近的执行器能力比较
+
+若暂时按单位最大舵角和悬停最大差分推力作量级比较：
+
+| 机体轴 | 最大角加速度量级 |
+|---|---:|
+| 俯仰 $b_y$ | 约 $215\ \mathrm{rad/s^2}$ |
+| 滚转 $b_x$ | 约 $108\ \mathrm{rad/s^2}$ |
+| 偏航 $b_z$ | 约 $90\ \mathrm{rad/s^2}$ |
+
+因此不考虑配平占用时：
+
+$$
+\text{俯仰}
+>
+\text{滚转}
+>
+\text{偏航}
+$$
+
+但是悬停时两个舵面还需要约：
+
+$$
+\delta_{\mathrm{trim}}
+\approx-0.27\ \mathrm{rad}
+$$
+
+的公共配平偏角。若保持两个舵面围绕该公共偏角作对称差动，则差动输入的对称余量约为：
+
+$$
+|\delta_d|_{\max}
+\approx
+1.0-0.27
+=
+0.73\ \mathrm{rad}
+$$
+
+对应滚转角加速度量级下降到：
+
+$$
+108.4\times0.73
+\approx79.1\ \mathrm{rad/s^2}
+$$
+
+因此考虑悬停配平余量后，更实际的结论是：
+
+$$
+\text{俯仰最强，滚转与偏航接近}
+$$
+
+俯仰本身也存在正负方向不对称的舵角余量：从 $-0.27\ \mathrm{rad}$ 配平点向正方向约有 $1.27\ \mathrm{rad}$ 理论行程，向负方向只有约 $0.73\ \mathrm{rad}$。所以实际俯仰控制能力也具有方向性。
+
+## 9.8 前飞时滚转和俯仰效率增加
+
+舵面力的有效系数包含：
+
+$$
+c_{L_T}^{\delta}\cos\bar\alpha\,T_i
++
+c_{L_V}^{\delta}\lVert v\rVert v_x^\alpha
+$$
+
+第一项来自螺旋桨滑流，第二项来自自由来流。
+
+当速度主要沿零升力轴方向时：
+
+$$
+v_x^\alpha\approx\lVert v\rVert\approx V
+$$
+
+所以自由来流舵效近似按：
+
+$$
+c_{L_V}^{\delta}V^2
+$$
+
+增加。
+
+在约 $6\ \mathrm{m/s}$、$v_x^\alpha\approx6\ \mathrm{m/s}$，并保留悬停量级螺旋桨滑流作为粗略工作点时：
+
+$$
+\frac{\partial\dot p}{\partial\delta_d}
+\approx
+272\
+\frac{\mathrm{rad/s^2}}{\mathrm{rad}}
+$$
+
+$$
+\frac{\partial\dot q}{\partial\delta_c}
+\approx
+539\
+\frac{\mathrm{rad/s^2}}{\mathrm{rad}}
+$$
+
+这些只是局部量级，实际值还取决于当时总推力、姿态、$v_x^\alpha$ 和舵面偏角。但趋势非常明确：
+
+- 前飞越快，滚转和俯仰舵面通常越有效；
+- 偏航主要依赖差分推力，不会像舵面一样按 $V^2$ 显著增强；
+- 高速前飞时，俯仰和滚转通常比偏航具有更大的局部角加速度效率。
+
+## 9.9 差分推力偏航为什么仍然很重要
+
+虽然按单位输入或最大角加速度量级，偏航不一定最高，但差分推力具有其他关键优势：
+
+- 静态悬停时仍然有效；
+- 不依赖机翼空速；
+- 电机横向力臂 `l_Ty = 0.15 m` 较大；
+- 可以产生论文中约 $6.1\ \mathrm N$ 的大差分推力；
+- 飞翼没有垂尾，因此差分推力承担主动方向稳定任务；
+- 在 knife-edge 和大侧滑工况中仍可直接控制 $m_z$。
+
+所以“差分推力偏航权威强”并不等价于“单位输入产生的角加速度一定是三轴最高”。
+
+## 9.10 当前动态模型中偏航不一定最快
+
+当前执行器动态为：
+
+```python
+motor_time_constant = 0.04
+servo_time_constant = 0.03
+```
+
+电机时间常数反而比舵机稍大。因此在当前仿真里，偏航差分推力的物理建立速度并不一定比舵面控制的滚转和俯仰更快。
+
+“偏航响应极快”更准确的含义应该是：
+
+- 无刷电机差分推力具有较强控制权威；
+- 全飞行包线内都可使用；
+- 不会在静态悬停时因空速为零而失效。
+
+它不表示当前一阶执行器模型中的偏航通道时间常数一定最小。
+
+## 9.11 为什么滚转 PD 增益最大
+
+当前姿态增益为：
+
+```python
+k_xi_roll = 78.4
+k_omega_roll = 14.0
+
+k_xi_pitch = 54.88
+k_omega_pitch = 9.8
+
+k_xi_yaw = 54.88
+k_omega_yaw = 9.8
+```
+
+这不表示滚转执行器效率最高。
+
+姿态 PD 输出的是期望角加速度：
+
+$$
+\dot{\pmb\Omega}_c
+=
+\pmb K_\xi\pmb\xi_e
++
+\pmb K_\Omega
+\left(
+\pmb\Omega_{\mathrm{ref}}
+-
+\pmb\Omega_{\mathrm{lpf}}
+\right)
+$$
+
+后续角 INDI 才将角加速度增量转换为力矩：
+
+$$
+\pmb m_c
+=
+\pmb J
+\left(
+\dot{\pmb\Omega}_c
+-
+\dot{\pmb\Omega}_{\mathrm{lpf}}
+\right)
++
+\pmb m_{\mathrm{lpf}}
+$$
+
+控制分配器再把力矩转换成电机和舵面命令。
+
+因此：
+
+$$
+K_\xi\text{ 较大}
+\not\Rightarrow
+\text{执行器效率较高}
+$$
+
+滚转增益较大表示当前调参希望滚转轴具有更高的指令闭环带宽，部分用于补偿：
+
+- $J_x$ 大于 $J_y$；
+- 滚转局部角加速度效率低于俯仰；
+- knife-edge 转换需要快速建立较大姿态变化；
+- 差动舵面还受到公共配平舵角的剩余行程约束。
+
+如果把角加速度控制视为理想，单轴近似闭环形式为：
+
+$$
+\ddot e
++
+K_\Omega\dot e
++
+K_\xi e
+\approx0
+$$
+
+其自然频率和阻尼近似为：
+
+$$
+\omega_n\approx\sqrt{K_\xi},\qquad
+\zeta\approx\frac{K_\Omega}{2\sqrt{K_\xi}}
+$$
+
+所以这些增益首先描述期望闭环动态，而不是气动或执行器的物理效率。
+
+## 9.12 最终结论
+
+按照当前参数的局部机体角加速度效率，在不考虑悬停配平占用时：
+
+$$
+\boxed{
+\text{俯仰 }b_y
+>
+\text{滚转 }b_x
+>
+\text{偏航 }b_z
+}
+$$
+
+考虑悬停公共舵面配平占用和完整执行器范围后，更实际的描述是：
+
+$$
+\boxed{
+\text{俯仰最强，滚转与偏航接近}
+}
+$$
+
+在约 $6\ \mathrm{m/s}$ 前飞时，自由来流使舵面控制效率显著增加，所以通常表现为：
+
+$$
+\boxed{
+\text{俯仰}
+>
+\text{滚转}
+>
+\text{偏航}
+}
+$$
+
+但这三个结论都针对机体系角速度分量 $[p,q,r]$。在尾座悬停和 knife-edge 姿态下，ZXY 欧拉角 Roll/Pitch/Yaw 不能与 $b_x,b_y,b_z$ 简单一一对应。判断某个欧拉角由哪个执行器主导时，还必须结合当前姿态下的欧拉角速度到机体角速度映射。

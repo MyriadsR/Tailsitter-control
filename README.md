@@ -26,6 +26,7 @@ Tailsitter-control/
 │   └── test.py                    # 分段轨迹及论文 Sec. VI-B～VI-F 轨迹
 │
 ├── utils/
+│   ├── filters.py                 # 15 Hz/1 Hz 二阶 Butterworth 在线滤波器
 │   └── math_help.py               # ZXY 欧拉角到四元数等数学工具
 │
 ├── results/
@@ -66,7 +67,9 @@ Tailsitter-control/
      加速度、角加速度和执行器滤波反馈
 ```
 
-仿真控制频率为 `100 Hz`，状态使用四元数积分，积分器为固定步长 RK4。
+当前仿真使用 `500 Hz` 控制与滤波更新频率，以兼顾论文滤波结构和运行速度。状态使用四元数积分，积分器为固定步长 RK4。IMU、转速和舵面测量使用匹配的 `15 Hz` 二阶 Butterworth 主低通，舵面瞬态由后续 `1 Hz` 二阶 Butterworth 高通提取。论文实机更新率为 `2000 Hz`。
+
+相较原来的 100 Hz 仿真，500 Hz 的完整多圈轨迹仍会增加一定运行时间，但明显快于严格采用 2000 Hz。
 
 ## 3. 坐标与数据约定
 
@@ -309,7 +312,7 @@ python results/Lemniscate/plot_lemniscate_results.py \
 - Lemniscate 根据论文给出的速度、圈时和圈数实现；
 - knife-edge transitioning 椭圆依据论文 Sec. VI-C、Fig. 7 和给出的载荷信息重建；
 - differential-thrust turn 根据 7 m/s、约 0.5 s 朝向反转和约 650 deg/s 最大角速度重建；
-- 当前仿真为 100 Hz，一阶 INDI 信号滤波；论文实验使用更高控制频率和二阶 Butterworth 滤波器。
+- 当前仿真使用 500 Hz 更新率，并保留论文的 15 Hz 二阶 Butterworth 主低通和 1 Hz 二阶 Butterworth 舵面高通；论文实机为 2000 Hz。此外，仿真没有模拟具体传感器噪声、异步电机编码器采样和固件浮点量化。
 
 因此，结果适合检查论文控制逻辑、坐标变换、执行器作用和轨迹跟踪趋势，不应将数值结果视为论文实验数据的完全复现。
 
