@@ -28,6 +28,7 @@ from trajectory.test import (
 
 # 导入数学工具
 from utils.math_help import zxy_euler_to_quaternion
+from utils.filters import SecondOrderButterworthFilter
 
 
 def zxy_euler_from_quaternion(q):
@@ -128,7 +129,8 @@ def main(
         raise ValueError(f"未知轨迹类型: {trajectory_name}")
     
     # === 仿真参数 ===
-    dt = 0.01  # 100Hz 控制频率
+    # 论文实机为 2000 Hz；当前仿真使用 config 中的 500 Hz 以缩短运行时间。
+    dt = 1.0 / cfg.control_rate_hz
     t_end = trajectory.total_duration
     steps = int(t_end / dt) + 1
 
@@ -264,20 +266,58 @@ def main(
         )
         a_lpf = state_dot_0[3:6].copy()
         a_lpf_tilde = a_lpf.copy()
-        omega_dot_lpf = state_dot_0[10:13].copy()
     else:
         # === INDI 滤波器初始状态 (低通滤波后的历史值) ===
         a_lpf = np.array([0.0, 0.0, cfg.g])
         a_lpf_tilde = np.array([0.0, 0.0, cfg.g])
-        omega_dot_lpf = np.zeros(3)
         f_alpha_lpf = np.zeros(3)
         m_lpf = np.zeros(3)
 
-    # 执行器测量滤波状态。delta_flaps_slow 是去除瞬态后的低频舵面分量，
-    # 同时用于平坦性变换和 Eq. (46) 中的 f_lpf，保证 INDI 两边信号一致。
+    # 论文 Sec. VI.A：IMU、电机转速和舵面测量使用完全相同的 15 Hz
+    # 二阶 Butterworth 低通，避免 INDI 两侧产生额外相位差。舵面低通结果
+    # 随后经过 1 Hz 二阶 Butterworth 高通，得到 Eq. (43) 的瞬态分量。
+    acceleration_lpf_filter = SecondOrderButterworthFilter(
+        cfg.indi_lpf_cutoff_hz,
+        cfg.control_rate_hz,
+        channels=3,
+        filter_type="lowpass",
+        initial_value=a_lpf,
+    )
+    angular_velocity_lpf_filter = SecondOrderButterworthFilter(
+        cfg.indi_lpf_cutoff_hz,
+        cfg.control_rate_hz,
+        channels=3,
+        filter_type="lowpass",
+        initial_value=omega_0,
+    )
+    rotor_lpf_filter = SecondOrderButterworthFilter(
+        cfg.indi_lpf_cutoff_hz,
+        cfg.control_rate_hz,
+        channels=2,
+        filter_type="lowpass",
+        initial_value=omega_rotors,
+    )
+    flap_lpf_filter = SecondOrderButterworthFilter(
+        cfg.indi_lpf_cutoff_hz,
+        cfg.control_rate_hz,
+        channels=2,
+        filter_type="lowpass",
+        initial_value=delta_flaps,
+    )
+    flap_hpf_filter = SecondOrderButterworthFilter(
+        cfg.flap_hpf_cutoff_hz,
+        cfg.control_rate_hz,
+        channels=2,
+        filter_type="highpass",
+        initial_value=delta_flaps,
+    )
+
+    omega_lpf = omega_0.copy()
+    omega_dot_lpf = np.zeros(3)
     omega_rotors_lpf = omega_rotors.copy()
     delta_flaps_lpf = delta_flaps.copy()
-    delta_flaps_slow = delta_flaps.copy()
+    delta_flaps_hpf = np.zeros(2)
+    delta_flaps_without_transient = delta_flaps.copy()
     
     # 记录数据用的列表
     log_t, log_pos, log_vel, log_acceleration = [], [], [], []
@@ -310,8 +350,8 @@ def main(
         
         # 4. 微分平坦变换 (受力 -> 姿态与推力)
         # 姿态/推力指令基于 INDI 实际力指令 f_c_i (含反馈, 论文 Eq 46)
-        # 论文 Sec. III.A 只在线加速度控制中使用近似恒定的低频舵面分量。
-        delta_sum = np.sum(delta_flaps_slow)
+        # 论文 Sec. III.A 只在线加速度控制中使用去除瞬态后的舵面分量。
+        delta_sum = np.sum(delta_flaps_without_transient)
         q_c, T_c = att_flat.compute_desired_attitude_and_thrust(f_c_i, vel, delta_sum, psi_ref, q_curr)
 
         # 平坦前馈角速度 Omega_ref: 严格由"参考轨迹"导出 (论文 Sec III.B), 与含反馈的
@@ -333,7 +373,9 @@ def main(
         )
         
         # 5. 内环控制 (姿态 -> 期望角加速度 -> INDI 期望力矩)
-        omega_dot_c = att_pd.compute_angular_acceleration_command(q_curr, q_c, omega_curr, omega_ref)
+        omega_dot_c = att_pd.compute_angular_acceleration_command(
+            q_curr, q_c, omega_lpf, omega_ref
+        )
         m_c = indi_ang.compute_moment_command(omega_dot_c, omega_dot_lpf, m_lpf)
         
         # 6. 控制分配 (推力、力矩 -> 电机转速、舵偏)
@@ -368,20 +410,25 @@ def main(
             if state[5] > 0.0:
                 state[5] = 0.0
         
-        # 9. 更新 INDI 滤波器状态 (在实际代码中来自传感器)
-        alpha_lpf = 0.35   # 主低通滤波系数（100 Hz 下离散 -3 dB 约 7 Hz）
-        alpha_slow = 0.06  # 慢变低通系数（约 1 Hz），用于构造舵面带通分量
-
-        # (a) 世界系实际加速度 (= v_dot, 已含重力, 对应论文 a_lpf)
+        # 9. 更新 INDI 传感器滤波状态（论文 Sec. IV、VI.A）
+        # (a) 世界系实际加速度 (= v_dot, 已含重力, 对应论文 a_lpf)。
         a_real_i = state_dot[3:6]
-        a_lpf = alpha_lpf * a_real_i + (1 - alpha_lpf) * a_lpf
+        a_lpf = acceleration_lpf_filter.update(a_real_i)
 
-        # (b) 对执行器测量施加与 IMU 主低通相匹配的滤波，再从舵面低通量中
-        #     分离慢变分量与带通瞬态分量。
-        omega_rotors_lpf = alpha_lpf * omega_rotors + (1 - alpha_lpf) * omega_rotors_lpf
-        delta_flaps_lpf = alpha_lpf * delta_flaps + (1 - alpha_lpf) * delta_flaps_lpf
-        delta_flaps_slow = alpha_slow * delta_flaps_lpf + (1 - alpha_slow) * delta_flaps_slow
-        delta_flaps_hpf = delta_flaps_lpf - delta_flaps_slow
+        # (b) IMU 角速度使用同一个主低通。论文中的角加速度反馈由低通
+        #     角速度数值微分获得，而不是直接低通理想角加速度。
+        omega_lpf_previous = omega_lpf.copy()
+        omega_lpf = angular_velocity_lpf_filter.update(omega_curr)
+        omega_dot_lpf = (omega_lpf - omega_lpf_previous) / dt
+
+        # (c) 对执行器测量施加与 IMU 完全相同的主低通，匹配相位延迟。
+        omega_rotors_lpf = rotor_lpf_filter.update(omega_rotors)
+        delta_flaps_lpf = flap_lpf_filter.update(delta_flaps)
+
+        # 论文 Eq. (43)：主低通后的舵面偏角再经过 1 Hz 二阶高通，得到
+        # 瞬态分量；不含瞬态的舵面量用于 Eq. (46) 和平坦性变换。
+        delta_flaps_hpf = flap_hpf_filter.update(delta_flaps_lpf)
+        delta_flaps_without_transient = delta_flaps_lpf - delta_flaps_hpf
 
         # Eq. (46) 的 f_lpf 必须使用“不含瞬态”的舵面分量；角加速度 INDI
         # 则使用普通低通舵面分量。二者均由滤波后的执行器测量重新计算，
@@ -390,8 +437,8 @@ def main(
             v_b,
             omega_rotors_lpf[0],
             omega_rotors_lpf[1],
-            delta_flaps_slow[0],
-            delta_flaps_slow[1],
+            delta_flaps_without_transient[0],
+            delta_flaps_without_transient[1],
         )
         _, m_lpf, _ = aero.compute_forces_and_moments(
             v_b,
@@ -408,14 +455,11 @@ def main(
             delta_flaps_hpf[1],
         )
 
-        # (c) 瞬态襟翼加速度修正 (论文 Eq. 43):
+        # (d) 瞬态襟翼加速度修正 (论文 Eq. 43):
         #     a_tilde_lpf = a_lpf - m^-1 * R_alpha^i * f_delta_hpf^alpha
         R_alpha_to_i = R_b_to_i @ R_alpha_to_b
         a_lpf_tilde = a_lpf - (1.0 / cfg.mass) * (R_alpha_to_i @ f_delta_hpf)
 
-        # (d) 其余 INDI 反馈信号
-        omega_dot_lpf = alpha_lpf * state_dot[10:13] + (1 - alpha_lpf) * omega_dot_lpf
-        
         # 记录日志
         log_t.append(t)
         log_pos.append(pos)
@@ -432,7 +476,7 @@ def main(
         log_angular_acceleration.append(state_dot[10:13].copy())
         log_angular_acceleration_lpf.append(omega_dot_lpf.copy())
         log_angular_acceleration_command.append(omega_dot_c.copy())
-        log_rotors.append(omega_rotors)
+        log_rotors.append(omega_rotors.copy())
         log_flaps.append(np.rad2deg(delta_flaps))
 
     print("仿真结束，正在绘图...")
