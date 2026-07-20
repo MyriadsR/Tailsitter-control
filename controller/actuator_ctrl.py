@@ -78,10 +78,15 @@ class ControlAllocator:
         # ==========================================
         # 第二步：计算单电机推力与转速 (Eq 38, Eq 6)
         # ==========================================
-        # 在保持总推力的前提下约束差分推力，使 T1、T2 均非负。
-        # 直接把负的单电机推力截为零会改变总推力，并使后续力矩剥离失配。
-        T_c = max(float(T_c), 0.0)
-        delta_T = np.clip(delta_T, -T_c, T_c)
+        # 在保持总推力的前提下同时约束单电机的上、下限。
+        # T1=(T_c+delta_T)/2, T2=(T_c-delta_T)/2，因此差分推力
+        # 的可行区间会随总推力收缩。
+        thrust_min = self.cfg.c_T * self.cfg.omega_min**2
+        thrust_max = self.cfg.c_T * self.cfg.omega_max**2
+        T_c = np.clip(float(T_c), 2.0 * thrust_min, 2.0 * thrust_max)
+        delta_lower = max(2.0 * thrust_min - T_c, T_c - 2.0 * thrust_max)
+        delta_upper = min(T_c - 2.0 * thrust_min, 2.0 * thrust_max - T_c)
+        delta_T = np.clip(delta_T, delta_lower, delta_upper)
         T1 = (T_c + delta_T) / 2.0
         T2 = (T_c - delta_T) / 2.0
         realized_delta_T = T1 - T2
@@ -139,7 +144,7 @@ class ControlAllocator:
         b_vec = np.array([m_delta_c[0], m_delta_c[1]])
         
         # 物理舵偏角限幅，并在边界上重新优化剩余自由度。
-        max_deflection = np.deg2rad(45.0)
+        max_deflection = self.cfg.delta_max
         delta_cmd = self._bounded_flap_allocation(M, b_vec, max_deflection)
         delta_1_cmd, delta_2_cmd = delta_cmd
         
