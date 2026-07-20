@@ -2,6 +2,8 @@
 Author: ZR
 Description: Tailsitter 飞翼无人机全系统闭环仿真主程序
 '''
+import argparse
+
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -15,6 +17,14 @@ from controller.pos_ctrl import PositionController
 from controller.INDI_acc_ctrl import INDILinearController
 from controller.att_ctrl import FlatnessAttitudeController, PDAttitudeController, INDIAngularController
 from controller.actuator_ctrl import ControlAllocator
+from trajectory.test import (
+    CircularTrajectory,
+    CircularTransitionTrajectory,
+    DifferentialThrustTurnTrajectory,
+    KnifeEdgeTransitionTrajectory,
+    LemniscateTrajectory,
+    TrajectoryGenerator,
+)
 
 # 导入数学工具
 from utils.math_help import zxy_euler_to_quaternion
@@ -30,14 +40,6 @@ def zxy_euler_from_quaternion(q):
     psi = np.arctan2(2.0 * (qw * qz - qx * qy), 1.0 - 2.0 * (qx**2 + qz**2))
     return np.array([psi, phi, theta])
 
-
-def quintic_segment(distance, tau, duration):
-    """五次多项式轨迹段，返回位置/速度/加速度/Jerk。"""
-    s = 10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5
-    s_dot = (30.0 * tau**2 - 60.0 * tau**3 + 30.0 * tau**4) / duration
-    s_ddot = (60.0 * tau - 180.0 * tau**2 + 120.0 * tau**3) / (duration**2)
-    s_dddot = (60.0 - 360.0 * tau + 360.0 * tau**2) / (duration**3)
-    return distance * s, distance * s_dot, distance * s_ddot, distance * s_dddot
 
 def rk4_step(dynamics_model, state, f_alpha, f_ext, moments, m_ext, R_b_alpha, dt):
     """自定义 4 阶龙格-库塔步进器，提升仿真速度"""
@@ -56,7 +58,14 @@ def rk4_step(dynamics_model, state, f_alpha, f_ext, moments, m_ext, R_b_alpha, d
     return next_state
 
 
-def main():
+def main(
+    trajectory_name="segments",
+    laps=None,
+    speed=None,
+    lap_time=None,
+    log_path="flight_log.npz",
+    show_plot=True,
+):
     print("初始化仿真环境...")
     cfg = TailsitterConfig()
     
@@ -71,66 +80,215 @@ def main():
     att_pd   = PDAttitudeController(cfg)
     indi_ang = INDIAngularController(cfg)
     allocator= ControlAllocator(cfg)
+    if trajectory_name == "lemniscate":
+        trajectory = LemniscateTrajectory(
+            speed=6.0 if speed is None else speed,
+            lap_time=7.0 if lap_time is None else lap_time,
+            laps=8 if laps is None else laps,
+        )
+    elif trajectory_name in {"knife-edge-transition", "circle-knife-edge"}:
+        # Sec. VI-C：椭圆跑道一侧 knife edge、另一侧 coordinated。
+        # circle-knife-edge 保留为兼容别名，避免旧命令继续误入 Sec. VI-D
+        # 的定半径圆；推荐使用语义明确的 knife-edge-transition。
+        trajectory = KnifeEdgeTransitionTrajectory(
+            speed=6.0 if speed is None else speed,
+            lap_time=6.25 if lap_time is None else lap_time,
+            laps=8 if laps is None else laps,
+        )
+    elif trajectory_name in {"circle-coordinated", "circular-knife-edge"}:
+        # Sec. VI-D：半径 3.5 m 的定常圆轨迹。
+        trajectory = CircularTrajectory(
+            mode=(
+                "coordinated"
+                if trajectory_name == "circle-coordinated"
+                else "knife_edge"
+            ),
+            speed=8.1 if speed is None else speed,
+            laps=4 if laps is None else laps,
+        )
+    elif trajectory_name in {"transition-to-forward", "transition-to-hover"}:
+        transition_duration = 3.0
+        target_speed = 8.1 if speed is None else speed
+        trajectory = CircularTransitionTrajectory(
+            transition=(
+                "to_forward"
+                if trajectory_name == "transition-to-forward"
+                else "to_hover"
+            ),
+            tangential_acceleration=target_speed / transition_duration,
+            duration=transition_duration,
+        )
+    elif trajectory_name == "differential-turn":
+        trajectory = DifferentialThrustTurnTrajectory(
+            speed=7.0 if speed is None else speed,
+        )
+    elif trajectory_name == "segments":
+        trajectory = TrajectoryGenerator()
+    else:
+        raise ValueError(f"未知轨迹类型: {trajectory_name}")
     
     # === 仿真参数 ===
     dt = 0.01  # 100Hz 控制频率
-    takeoff_duration = 6.0
-    hover_1_duration = 5.0
-    forward_duration = 6.0
-    hover_2_duration = 5.0
-    right_duration = 6.0
-    hover_3_duration = 5.0
-    t_end = (
-        takeoff_duration
-        + hover_1_duration
-        + forward_duration
-        + hover_2_duration
-        + right_duration
-        + hover_3_duration
-    )
+    t_end = trajectory.total_duration
     steps = int(t_end / dt) + 1
-    
-    # === 初始状态 ===
-    # NED 坐标系下地面起飞，地面高度设为 Z = 0
-    pos_0 = np.array([0.0, 0.0, 0.0])
-    vel_0 = np.array([0.0, 0.0, 0.0])
-    
-    # Tailsitter 悬停时机头朝上，推力抵消重力，即机体 X 轴指向世界 -Z
-    # 对应 ZXY 欧拉角的 Pitch = 90 度
-    q_0 = zxy_euler_to_quaternion(0.0, 0.0, np.pi/2)
-    omega_0 = np.array([0.0, 0.0, 0.0])
-    
-    state = np.concatenate([pos_0, vel_0, q_0, omega_0])
-    
-    # === INDI 滤波器初始状态 (低通滤波后的历史值) ===
-    a_lpf = np.array([0.0, 0.0, cfg.g])        # 世界系实际加速度的低通 (论文 a_lpf)
-    a_lpf_tilde = np.array([0.0, 0.0, cfg.g])  # 去除瞬态襟翼分量后的加速度 (论文 Eq 43)
-    omega_dot_lpf = np.array([0.0, 0.0, 0.0])
-    f_alpha_lpf = np.array([0.0, 0.0, 0.0])
-    m_lpf = np.array([0.0, 0.0, 0.0])
-    # 执行器测量滤波状态。delta_flaps_slow 是去除瞬态后的低频舵面分量，
-    # 同时用于平坦性变换和 Eq. (46) 中的 f_lpf，保证 INDI 两边信号一致。
-    omega_rotors_lpf = np.zeros(2)
-    delta_flaps_lpf = np.zeros(2)
-    delta_flaps_slow = np.zeros(2)
-    
-    # 初始执行器状态
-    # hover_thrust_per_motor = (cfg.mass * cfg.g) / 2.0
-    omega_rotors = np.array([0.0, 0.0])
-    delta_flaps = np.array([0.0, 0.0])
-    
-    # 记录数据用的列表
-    log_t, log_pos, log_euler, log_rotors, log_flaps = [], [], [], [], []
-    log_x_ref = []
-    
-    # 预计算常数旋转矩阵（角度符号由 alpha_0 自身决定）
-    # 注意这里 alpha_0 自带正负号
+
+    # 预计算零升力系与机体系之间的常数旋转矩阵。
     ca0, sa0 = np.cos(cfg.alpha_0), np.sin(cfg.alpha_0)
     R_b_to_alpha = np.array([[ca0, 0, sa0], [0, 1, 0], [-sa0, 0, ca0]])
     R_alpha_to_b = R_b_to_alpha.T
-    # gravity_comp_i = np.array([0.0, 0.0, -cfg.g])  # NED 下抵消重力需沿 -Z 方向补偿
+    
+    # === 初始状态 ===
+    initial_state_mode = trajectory.initial_state_mode
+    initial_flap_deflection = 0.0
+    if initial_state_mode == "reference":
+        # 论文试验是在已经进入双纽线的定常飞行状态下开始记录，而不是从
+        # 地面静止瞬间跳变到 6 m/s。用 t=0 的平坦输出初始化状态和推力，
+        # 使闭环误差主要反映跟踪能力而非不连续初值造成的巨大瞬态。
+        pos_0, vel_0, acc_0, jerk_0, psi_0, psi_dot_0 = trajectory.sample(0.0)
+        q_seed = zxy_euler_to_quaternion(psi_0, 0.0, 0.0)
+        f_ref_0 = cfg.mass * (acc_0 - np.array([0.0, 0.0, cfg.g]))
+        # 定常圆周飞行中 c_mu_T 需要由同向舵面力矩抵消。
+        # 舵面配平又会改变平坦性变换的姿态和总推力，因此在
+        # 启动仿真前做少量不动点迭代，避免从零舵偏瞬间跳到配平值。
+        initial_flap_deflection = -0.27
+        q_0 = q_seed
+        for _ in range(12):
+            q_0, thrust_0, phi_0, theta_bar_0 = (
+                att_flat.compute_desired_attitude_and_thrust(
+                    f_ref_0,
+                    vel_0,
+                    2.0 * initial_flap_deflection,
+                    psi_0,
+                    q_0,
+                    return_angles=True,
+                )
+            )
+            R_i_to_b_trim = dyn._quat_to_rot_matrix(q_0).T
+            v_b_trim = R_i_to_b_trim @ vel_0
+            v_alpha_x_trim = ca0 * v_b_trim[0] + sa0 * v_b_trim[2]
+            flap_force_slope = (
+                cfg.c_LT_delta * np.cos(cfg.alpha_0 + cfg.alpha_T) * thrust_0
+                + 2.0
+                * cfg.c_LV_delta
+                * np.linalg.norm(vel_0)
+                * v_alpha_x_trim
+            )
+            if abs(flap_force_slope) > 1e-8:
+                trim_target = (
+                    cfg.c_mu_T * thrust_0 / (cfg.l_dx * flap_force_slope)
+                )
+                trim_target = np.clip(
+                    trim_target, -cfg.delta_max, cfg.delta_max
+                )
+                initial_flap_deflection = (
+                    0.5 * initial_flap_deflection + 0.5 * trim_target
+                )
 
-    print("开始仿真运行...")
+        # 使最终姿态/推力严格对应迭代后的舵面配平值。
+        q_0, thrust_0, phi_0, theta_bar_0 = (
+            att_flat.compute_desired_attitude_and_thrust(
+                f_ref_0,
+                vel_0,
+                2.0 * initial_flap_deflection,
+                psi_0,
+                q_0,
+                return_angles=True,
+            )
+        )
+        omega_0 = att_flat.compute_feedforward_angular_velocity(
+            vel_0,
+            acc_0,
+            jerk_0,
+            psi_0,
+            psi_dot_0,
+            f_ref_0,
+            phi_0,
+            theta_bar_0,
+            2.0 * initial_flap_deflection,
+        )
+        initial_rotor_speed = np.sqrt(max(thrust_0, 0.0) / (2.0 * cfg.c_T))
+        omega_rotors = np.full(2, initial_rotor_speed)
+    elif initial_state_mode == "hover":
+        # 加速 transition 的参考在 t=0 存在切向加速度阶跃，但论文试验从
+        # 静止悬停进入该轨迹。因此状态按同一位置和 yaw 下的真实悬停初始化。
+        pos_0, _, _, _, psi_0, _ = trajectory.sample(0.0)
+        vel_0 = np.zeros(3)
+        omega_0 = np.zeros(3)
+        q_seed = zxy_euler_to_quaternion(psi_0, 0.0, np.pi / 2.0)
+        f_hover = -cfg.mass * np.array([0.0, 0.0, cfg.g])
+        initial_flap_deflection = -0.27
+        q_0, thrust_0 = att_flat.compute_desired_attitude_and_thrust(
+            f_hover,
+            vel_0,
+            2.0 * initial_flap_deflection,
+            psi_0,
+            q_seed,
+        )
+        initial_rotor_speed = np.sqrt(max(thrust_0, 0.0) / (2.0 * cfg.c_T))
+        omega_rotors = np.full(2, initial_rotor_speed)
+    elif initial_state_mode == "ground":
+        # NED 坐标系下地面起飞，地面高度设为 Z = 0。
+        pos_0 = np.array([0.0, 0.0, 0.0])
+        vel_0 = np.array([0.0, 0.0, 0.0])
+
+        # Tailsitter 悬停时机头朝上，推力抵消重力，即机体 X 轴指向世界 -Z。
+        q_0 = zxy_euler_to_quaternion(0.0, 0.0, np.pi/2)
+        omega_0 = np.array([0.0, 0.0, 0.0])
+        omega_rotors = np.zeros(2)
+    else:
+        raise ValueError(f"未知初始状态模式: {initial_state_mode}")
+    
+    state = np.concatenate([pos_0, vel_0, q_0, omega_0])
+    
+    # 初始执行器状态
+    delta_flaps = np.full(2, initial_flap_deflection)
+
+    if initial_state_mode != "ground":
+        R_i_to_b_0 = dyn._quat_to_rot_matrix(q_0).T
+        v_b_0 = R_i_to_b_0 @ vel_0
+        f_alpha_lpf, m_lpf, _ = aero.compute_forces_and_moments(
+            v_b_0,
+            omega_rotors[0],
+            omega_rotors[1],
+            delta_flaps[0],
+            delta_flaps[1],
+        )
+        state_dot_0 = dyn.compute_state_derivatives(
+            0.0,
+            state,
+            f_alpha_lpf,
+            np.zeros(3),
+            m_lpf,
+            np.zeros(3),
+            R_alpha_to_b,
+        )
+        a_lpf = state_dot_0[3:6].copy()
+        a_lpf_tilde = a_lpf.copy()
+        omega_dot_lpf = state_dot_0[10:13].copy()
+    else:
+        # === INDI 滤波器初始状态 (低通滤波后的历史值) ===
+        a_lpf = np.array([0.0, 0.0, cfg.g])
+        a_lpf_tilde = np.array([0.0, 0.0, cfg.g])
+        omega_dot_lpf = np.zeros(3)
+        f_alpha_lpf = np.zeros(3)
+        m_lpf = np.zeros(3)
+
+    # 执行器测量滤波状态。delta_flaps_slow 是去除瞬态后的低频舵面分量，
+    # 同时用于平坦性变换和 Eq. (46) 中的 f_lpf，保证 INDI 两边信号一致。
+    omega_rotors_lpf = omega_rotors.copy()
+    delta_flaps_lpf = delta_flaps.copy()
+    delta_flaps_slow = delta_flaps.copy()
+    
+    # 记录数据用的列表
+    log_t, log_pos, log_vel, log_acceleration = [], [], [], []
+    log_euler, log_euler_command = [], []
+    log_angular_velocity, log_angular_velocity_ref = [], []
+    log_angular_acceleration, log_angular_acceleration_lpf = [], []
+    log_angular_acceleration_command = []
+    log_rotors, log_flaps = [], []
+    log_x_ref, log_v_ref, log_a_ref, log_psi_ref = [], [], [], []
+    
+    print(f"开始仿真运行，轨迹: {trajectory_name}...")
     for step in range(steps):
         t = step * dt
         
@@ -142,52 +300,8 @@ def main():
         R_i_to_b = dyn._quat_to_rot_matrix(q_curr).T
         R_b_to_i = R_i_to_b.T
         
-        # 2. 任务轨迹：垂直起飞到 10m -> 悬停 5s -> 前飞 10m -> 悬停 5s -> 向右飞 10m -> 悬停 5s
-        t_takeoff_end = takeoff_duration
-        t_hover1_end = t_takeoff_end + hover_1_duration
-        t_forward_end = t_hover1_end + forward_duration
-        t_hover2_end = t_forward_end + hover_2_duration
-        t_right_end = t_hover2_end + right_duration
-
-        if t <= takeoff_duration:
-            tau = t / takeoff_duration
-            z_pos, z_vel, z_acc, z_jerk = quintic_segment(-10.0, tau, takeoff_duration)
-            x_ref = np.array([0.0, 0.0, z_pos])
-            v_ref = np.array([0.0, 0.0, z_vel])
-            a_ref = np.array([0.0, 0.0, z_acc])
-            j_ref = np.array([0.0, 0.0, z_jerk])
-        elif t <= t_hover1_end:
-            x_ref = np.array([0.0, 0.0, -10.0])
-            v_ref = np.array([0.0, 0.0, 0.0])
-            a_ref = np.array([0.0, 0.0, 0.0])
-            j_ref = np.array([0.0, 0.0, 0.0])
-        elif t <= t_forward_end:
-            tau = (t - t_hover1_end) / forward_duration
-            x_pos, x_vel, x_acc, x_jerk = quintic_segment(10.0, tau, forward_duration)
-            x_ref = np.array([x_pos, 0.0, -10.0])
-            v_ref = np.array([x_vel, 0.0, 0.0])
-            a_ref = np.array([x_acc, 0.0, 0.0])
-            j_ref = np.array([x_jerk, 0.0, 0.0])
-        elif t <= t_hover2_end:
-            x_ref = np.array([10.0, 0.0, -10.0])
-            v_ref = np.array([0.0, 0.0, 0.0])
-            a_ref = np.array([0.0, 0.0, 0.0])
-            j_ref = np.array([0.0, 0.0, 0.0])
-        elif t <= t_right_end:
-            tau = (t - t_hover2_end) / right_duration
-            y_pos, y_vel, y_acc, y_jerk = quintic_segment(10.0, tau, right_duration)
-            x_ref = np.array([10.0, y_pos, -10.0])
-            v_ref = np.array([0.0, y_vel, 0.0])
-            a_ref = np.array([0.0, y_acc, 0.0])
-            j_ref = np.array([0.0, y_jerk, 0.0])
-        else:
-            x_ref = np.array([10.0, 10.0, -10.0])
-            v_ref = np.array([0.0, 0.0, 0.0])
-            a_ref = np.array([0.0, 0.0, 0.0])
-            j_ref = np.array([0.0, 0.0, 0.0])
-            
-        psi_ref = 0.0
-        psi_dot_ref = 0.0
+        # 2. 从独立轨迹模块读取位置及其导数、偏航角和偏航角速度参考。
+        x_ref, v_ref, a_ref, j_ref, psi_ref, psi_dot_ref = trajectory.sample(t)
         
         # 3. 外环控制 (位置 -> 期望加速度 -> INDI 期望力)
         a_c = pos_ctrl.compute_acceleration_command(x_ref, v_ref, a_ref, pos, vel, a_lpf_tilde, R_b_to_i)
@@ -226,10 +340,17 @@ def main():
         v_b = R_i_to_b @ vel
         omega_cmd, delta_cmd = allocator.allocate_controls(T_c, m_c, v_b)
         
-        # 模拟执行器延迟 (一阶低通滤波)
-        alpha_act = 0.8
-        omega_rotors = alpha_act * omega_cmd + (1 - alpha_act) * omega_rotors
-        delta_flaps = alpha_act * delta_cmd + (1 - alpha_act) * delta_flaps
+        # 模拟电机和舵机的不同一阶动态。舵面另施加带载角速率
+        # 限制，避免单个仿真步内产生不可实现的大幅跳变。
+        motor_alpha = 1.0 - np.exp(-dt / cfg.motor_time_constant)
+        servo_alpha = 1.0 - np.exp(-dt / cfg.servo_time_constant)
+        omega_rotors += motor_alpha * (omega_cmd - omega_rotors)
+        omega_rotors = np.clip(omega_rotors, cfg.omega_min, cfg.omega_max)
+
+        delta_step = servo_alpha * (delta_cmd - delta_flaps)
+        max_delta_step = cfg.servo_rate_max * dt
+        delta_flaps += np.clip(delta_step, -max_delta_step, max_delta_step)
+        delta_flaps = np.clip(delta_flaps, -cfg.delta_max, cfg.delta_max)
         
         # 7. 物理环境计算真实的受力与力矩
         f_alpha_real, m_body_real, _ = aero.compute_forces_and_moments(
@@ -298,8 +419,19 @@ def main():
         # 记录日志
         log_t.append(t)
         log_pos.append(pos)
+        log_vel.append(vel)
         log_x_ref.append(x_ref)
+        log_v_ref.append(v_ref)
+        log_a_ref.append(a_ref)
+        log_psi_ref.append(psi_ref)
+        log_acceleration.append(a_real_i.copy())
         log_euler.append(np.rad2deg(zxy_euler_from_quaternion(q_curr)))
+        log_euler_command.append(np.rad2deg(zxy_euler_from_quaternion(q_c)))
+        log_angular_velocity.append(omega_curr.copy())
+        log_angular_velocity_ref.append(omega_ref.copy())
+        log_angular_acceleration.append(state_dot[10:13].copy())
+        log_angular_acceleration_lpf.append(omega_dot_lpf.copy())
+        log_angular_acceleration_command.append(omega_dot_c.copy())
         log_rotors.append(omega_rotors)
         log_flaps.append(np.rad2deg(delta_flaps))
 
@@ -308,14 +440,62 @@ def main():
     # === 绘图 ===
     log_t = np.array(log_t)
     log_pos = np.array(log_pos)
+    log_vel = np.array(log_vel)
     log_x_ref = np.array(log_x_ref)
+    log_v_ref = np.array(log_v_ref)
+    log_a_ref = np.array(log_a_ref)
+    log_psi_ref = np.array(log_psi_ref)
+    log_acceleration = np.array(log_acceleration)
     log_euler = np.array(log_euler)
+    log_euler_command = np.array(log_euler_command)
+    log_angular_velocity = np.array(log_angular_velocity)
+    log_angular_velocity_ref = np.array(log_angular_velocity_ref)
+    log_angular_acceleration = np.array(log_angular_acceleration)
+    log_angular_acceleration_lpf = np.array(log_angular_acceleration_lpf)
+    log_angular_acceleration_command = np.array(log_angular_acceleration_command)
     log_rotors = np.array(log_rotors)
     log_flaps = np.array(log_flaps)
+
+    # 保存独立动画程序所需的时序日志。欧拉角顺序固定为 [psi, phi, theta]，
+    # 单位为度；位置采用仿真使用的世界 NED 坐标系。
+    np.savez_compressed(
+        log_path,
+        time=log_t,
+        position=log_pos,
+        velocity=log_vel,
+        acceleration=log_acceleration,
+        position_ref=log_x_ref,
+        velocity_ref=log_v_ref,
+        acceleration_ref=log_a_ref,
+        psi_ref=log_psi_ref,
+        euler_deg=log_euler,
+        euler_command_deg=log_euler_command,
+        angular_velocity=log_angular_velocity,
+        angular_velocity_ref=log_angular_velocity_ref,
+        angular_acceleration=log_angular_acceleration,
+        angular_acceleration_lpf=log_angular_acceleration_lpf,
+        angular_acceleration_command=log_angular_acceleration_command,
+        rotor_speed=log_rotors,
+        flap_deg=log_flaps,
+        coordinate_frame=np.array("NED"),
+        euler_sequence=np.array("ZXY"),
+    )
+    print(f"仿真日志已保存到 {log_path}")
 
     # 位置跟踪误差统计 (RMS / 最大)
     pos_err_norm = np.linalg.norm(log_x_ref - log_pos, axis=1)
     print(f"位置跟踪误差:  RMS = {np.sqrt(np.mean(pos_err_norm**2)):.3f} m,  最大 = {pos_err_norm.max():.3f} m")
+
+    speed_actual = np.linalg.norm(log_vel, axis=1)
+    speed_reference = np.linalg.norm(log_v_ref, axis=1)
+    yaw_actual = np.deg2rad(log_euler[:, 0])
+    yaw_error = (yaw_actual - log_psi_ref + np.pi) % (2.0 * np.pi) - np.pi
+    differential_thrust = cfg.c_T * (
+        log_rotors[:, 0] ** 2 - log_rotors[:, 1] ** 2
+    )
+    reference_specific_force = np.linalg.norm(
+        log_a_ref - np.array([0.0, 0.0, cfg.g]), axis=1
+    ) / cfg.g
     
     plt.figure(figsize=(12, 10))
     
@@ -327,7 +507,7 @@ def main():
     plt.ylabel('Position (m)')
     plt.legend()
     plt.grid()
-    plt.title('Tailsitter Trajectory & Attitude Simulation')
+    plt.title(f'Tailsitter Simulation: {trajectory_name}')
     
     plt.subplot(3, 1, 2)
     plt.plot(log_t, log_euler[:, 0], label='Yaw (deg)')
@@ -348,7 +528,69 @@ def main():
     plt.grid()
     
     plt.tight_layout()
-    plt.show()
+    if show_plot:
+        plt.show()
+    else:
+        plt.close()
+
+    return {
+        "trajectory": trajectory_name,
+        "rms_position_error": float(np.sqrt(np.mean(pos_err_norm**2))),
+        "max_position_error": float(pos_err_norm.max()),
+        "rms_yaw_error_deg": float(
+            np.rad2deg(np.sqrt(np.mean(yaw_error**2)))
+        ),
+        "min_actual_speed": float(speed_actual.min()),
+        "max_actual_speed": float(speed_actual.max()),
+        "min_reference_speed": float(speed_reference.min()),
+        "max_reference_speed": float(speed_reference.max()),
+        "max_reference_specific_force_g": float(reference_specific_force.max()),
+        "max_rotor_speed": float(np.max(log_rotors)),
+        "max_abs_flap_deg": float(np.max(np.abs(log_flaps))),
+        "max_abs_differential_thrust": float(
+            np.max(np.abs(differential_thrust))
+        ),
+        "finite": bool(
+            np.all(np.isfinite(state))
+            and np.all(np.isfinite(log_pos))
+            and np.all(np.isfinite(log_euler))
+        ),
+        "duration": float(t_end),
+    }
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Tailsitter 全系统闭环仿真")
+    parser.add_argument(
+        "--trajectory",
+        choices=(
+            "segments",
+            "lemniscate",
+            "knife-edge-transition",
+            "circle-coordinated",
+            "circle-knife-edge",
+            "circular-knife-edge",
+            "transition-to-forward",
+            "transition-to-hover",
+            "differential-turn",
+        ),
+        default="segments",
+        help="选择分段轨迹或论文中的试验轨迹",
+    )
+    parser.add_argument("--laps", type=int, help="闭合轨迹圈数；省略时使用论文默认值")
+    parser.add_argument(
+        "--speed", type=float, help="覆盖所选轨迹的默认参考速度 (m/s)"
+    )
+    parser.add_argument(
+        "--lap-time", type=float, help="覆盖双纽线或椭圆跑道的单圈时间 (s)"
+    )
+    parser.add_argument("--log", default="flight_log.npz", help="NPZ 日志输出路径")
+    parser.add_argument("--no-show", action="store_true", help="仿真后不打开绘图窗口")
+    args = parser.parse_args()
+    main(
+        args.trajectory,
+        args.laps,
+        args.speed,
+        args.lap_time,
+        args.log,
+        not args.no_show,
+    )
