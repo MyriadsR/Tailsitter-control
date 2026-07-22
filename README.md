@@ -9,6 +9,7 @@ Tailsitter-control/
 ├── main_sim.py                    # 闭环仿真入口、执行器动态、INDI 滤波与日志保存
 ├── config.py                      # 质量、惯量、几何、气动、执行器和控制增益
 ├── animate_flight.py              # 位置与姿态的三维动画
+├── vis_vtol.stl                   # 三维动画使用的尾座飞行器模型
 ├── setup_vtol_sim_env.sh          # Conda 环境创建/更新脚本
 │
 ├── controller/
@@ -78,7 +79,8 @@ Tailsitter-control/
 - 四元数顺序为 `[qw, qx, qy, qz]`，表示机体系到世界系的旋转。
 - 欧拉角采用 ZXY 顺序 `[psi, phi, theta]`，日志中的单位为度。
 - 电机转速单位为 `rad/s`，日志中的舵面偏角单位为度。
-- 动画中红、绿、蓝轴分别表示机体 `b_x`、`b_y`、`b_z`。
+- 动画默认使用 `vis_vtol.stl` 表示飞行器。模型轴映射为：STL `+x -> b_z`、
+  STL `+y -> -b_y`、STL `+z -> b_x`；`--show-body-axes` 可临时叠加机体轴校验方向。
 
 ZXY 欧拉角在奇异姿态附近可能跳变，它主要用于绘图；控制器内部姿态使用四元数。
 
@@ -97,6 +99,8 @@ conda activate vtol_sim
 - NumPy
 - SciPy
 - Matplotlib
+- PyVista / VTK
+- ImageIO / ImageIO-FFmpeg
 
 也可以指定环境名或重新创建环境：
 
@@ -231,16 +235,21 @@ python main_sim.py --trajectory knife-edge-transition \
 
 ## 8. 三维飞行动画
 
+动画使用 PyVista/VTK 的 GPU 渲染管线。STL 网格只在场景创建时上传一次，
+播放时仅更新飞行器 Actor 的 4×4 位姿矩阵，不会逐帧重建三角面。
+
 在生成对应日志后，可按预设轨迹直接播放：
 
 ```bash
 python animate_flight.py --trajectory lemniscate
-python animate_flight.py --trajectory knife-edge-transition
-python animate_flight.py --trajectory circle-coordinated
-python animate_flight.py --trajectory circular-knife-edge
-python animate_flight.py --trajectory transition-to-forward
-python animate_flight.py --trajectory transition-to-hover
-python animate_flight.py --trajectory differential-turn
+# 0.5 倍速，即慢两倍
+python animate_flight.py --trajectory lemniscate --speed 0.5
+python animate_flight.py --trajectory knife-edge-transition --speed 0.5
+python animate_flight.py --trajectory circle-coordinated --speed 0.5
+python animate_flight.py --trajectory circular-knife-edge --speed 0.5
+python animate_flight.py --trajectory transition-to-forward --speed 0.5
+python animate_flight.py --trajectory transition-to-hover --speed 0.5
+python animate_flight.py --trajectory differential-turn --speed 0.5
 ```
 
 也可以指定任意日志：
@@ -248,7 +257,19 @@ python animate_flight.py --trajectory differential-turn
 ```bash
 python animate_flight.py validation_logs/lemniscate.npz
 python animate_flight.py validation_logs/circle-coordinated.npz \
-  --stride 10 --speed 1.5 --axis-length 1.2
+  --stride 10 --speed 1.5
+```
+
+默认 STL 旋转中心是模型包围盒中心。如果已知飞行器重心在 STL 坐标中的位置，
+可通过 `--model-origin` 指定；也可以调整模型尺寸或临时显示机体轴：
+
+```bash
+python animate_flight.py validation_logs/lemniscate.npz \
+  --model vis_vtol.stl --model-scale 1.0 \
+  --model-origin 0.0 0.0 0.27
+
+python animate_flight.py validation_logs/lemniscate.npz \
+  --show-body-axes --axis-length 1.2
 ```
 
 保存 GIF 或 MP4：
@@ -268,7 +289,8 @@ python animate_flight.py --all-trajectories \
   --output-dir trajectory_animations --format gif --no-show
 ```
 
-MP4 导出需要系统安装 FFmpeg。完整参数可通过 `python animate_flight.py --help` 查看。
+MP4 编码器由 `imageio-ffmpeg` 随环境安装。GIF 需要逐帧颜色量化，批量导出时
+通常 MP4 更快、文件也更小。完整参数可通过 `python animate_flight.py --help` 查看。
 
 ## 9. 生成论文风格结果图
 

@@ -44,7 +44,9 @@ CONDA_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    # Example: "pandas==2.2.2"
+    "pyvista>=0.46,<0.49"
+    "imageio"
+    "imageio-ffmpeg"
 )
 
 if ! command -v conda >/dev/null 2>&1; then

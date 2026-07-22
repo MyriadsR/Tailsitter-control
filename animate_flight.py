@@ -1,14 +1,29 @@
-"""使用仿真日志绘制尾座飞行器位置与姿态的三维动画。"""
+"""使用 PyVista/VTK 将仿真日志绘制为尾座飞行器三维轨迹动画。"""
 
 import argparse
+import time as wall_time
 from pathlib import Path
 
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
+import pyvista as pv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent
+DEFAULT_MODEL_PATH = PROJECT_ROOT / "vis_vtol.stl"
+
+# vis_vtol.stl 到项目机体系的固定坐标映射：
+#   STL +x -> body +z, STL +y -> body -y, STL +z -> body +x。
+# 矩阵的每一列分别是 STL 三个单位轴在机体系中的表示。
+STL_TO_BODY_ROTATION = np.array(
+    [
+        [0.0, 0.0, 1.0],
+        [0.0, -1.0, 0.0],
+        [1.0, 0.0, 0.0],
+    ]
+)
+
+# NED 世界系转为动画使用的 North-East-Up 显示坐标系。
+NED_TO_DISPLAY_ROTATION = np.diag([1.0, 1.0, -1.0])
 
 # 论文 Sec. VI-B～VI-F 的七种闭环验证日志（另含 circle-knife-edge
 # 兼容别名），以及针对各自时长设置的默认抽帧和播放倍率。命令行传入
@@ -116,17 +131,44 @@ def ned_to_display(vectors):
     return displayed
 
 
-def set_equal_3d_limits(ax, points, margin):
-    """设置固定且等比例的三维坐标范围，避免动画过程中视图缩放。"""
-    minimum = np.min(points, axis=0)
-    maximum = np.max(points, axis=0)
-    center = 0.5 * (minimum + maximum)
-    half_range = max(0.5 * np.max(maximum - minimum) + margin, margin, 1.0)
+def prepare_stl_model(path, scale=1.0, origin_stl=None):
+    """读取 STL，并将其居中、缩放、转换到项目机体系。"""
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"找不到 STL 模型 {path}")
+    if scale <= 0.0:
+        raise ValueError("model_scale 必须大于 0")
 
-    ax.set_xlim(center[0] - half_range, center[0] + half_range)
-    ax.set_ylim(center[1] - half_range, center[1] + half_range)
-    ax.set_zlim(center[2] - half_range, center[2] + half_range)
-    ax.set_box_aspect((1.0, 1.0, 1.0))
+    mesh = pv.read(path)
+    if isinstance(mesh, pv.MultiBlock):
+        mesh = mesh.combine().extract_surface()
+    mesh = mesh.triangulate()
+    if mesh.n_points == 0 or mesh.n_cells == 0:
+        raise ValueError(f"{path} 中没有有效的 STL 三角面")
+
+    vertices_stl = np.asarray(mesh.points, dtype=float)
+    if not np.all(np.isfinite(vertices_stl)):
+        raise ValueError(f"{path} 中包含 NaN 或无穷顶点")
+    minimum = np.min(vertices_stl, axis=0)
+    maximum = np.max(vertices_stl, axis=0)
+    if origin_stl is None:
+        origin_stl = 0.5 * (minimum + maximum)
+    else:
+        origin_stl = np.asarray(origin_stl, dtype=float)
+        if origin_stl.shape != (3,) or not np.all(np.isfinite(origin_stl)):
+            raise ValueError("model_origin 必须是三个有限数值")
+
+    centered_scaled = scale * (vertices_stl - origin_stl)
+    mesh.points = centered_scaled @ STL_TO_BODY_ROTATION.T
+    mesh.compute_normals(
+        cell_normals=True,
+        point_normals=True,
+        consistent_normals=False,
+        auto_orient_normals=False,
+        inplace=True,
+    )
+    extent_stl = maximum - minimum
+    return mesh, origin_stl, extent_stl
 
 
 def load_flight_log(path):
@@ -167,18 +209,22 @@ def create_animation(
     position_ned,
     euler_deg,
     position_ref_ned=None,
+    model_mesh_body=None,
     axis_length=1.2,
     stride=5,
     speed=1.0,
     repeat=True,
+    show_body_axes=False,
     title="Tailsitter 3D Position and Attitude",
+    off_screen=False,
+    window_size=(1104, 912),
 ):
-    """创建三维轨迹与机体轴动画，返回 figure、animation 和播放帧率。"""
+    """创建 PyVista/VTK 场景；模型网格保持不变，每帧只更新 Actor 变换。"""
     if stride < 1:
         raise ValueError("stride 必须大于等于 1")
     if speed <= 0.0:
         raise ValueError("speed 必须大于 0")
-    if axis_length <= 0.0:
+    if show_body_axes and axis_length <= 0.0:
         raise ValueError("axis_length 必须大于 0")
 
     position = ned_to_display(position_ned)
@@ -197,99 +243,184 @@ def create_animation(
     interval_ms = 1000.0 * np.median(positive_dt) / speed
     fps = 1000.0 / interval_ms
 
-    fig = plt.figure(figsize=(11, 9))
-    ax = fig.add_subplot(111, projection="3d")
-    ax.set_xlabel("North X (m)")
-    ax.set_ylabel("East Y (m)")
-    ax.set_zlabel("Altitude -Z_NED (m)")
-    ax.set_title(title)
-    ax.grid(True)
-    ax.view_init(elev=25.0, azim=-55.0)
+    plotter = pv.Plotter(off_screen=off_screen, window_size=window_size)
+    plotter.set_background("#FAFAFA")
+    plotter.add_title(title, font_size=14, color="#202020")
 
+    # 轨迹只上传到 VTK 一次。飞行器运动时不再重建线或三角面。
     limit_points = position
     if position_ref is not None:
         limit_points = np.vstack((limit_points, position_ref))
-        ax.plot(
-            position_ref[:, 0],
-            position_ref[:, 1],
-            position_ref[:, 2],
-            color="0.65",
-            linestyle="--",
-            linewidth=1.2,
-            label="Reference trajectory",
+        plotter.add_mesh(
+            pv.lines_from_points(position_ref),
+            color="#A6A6A6",
+            line_width=2.0,
+            label="Ref.",
+            lighting=False,
         )
-    set_equal_3d_limits(ax, limit_points, margin=1.5 * axis_length)
+    plotter.add_mesh(
+        pv.lines_from_points(position),
+        color="#202020",
+        line_width=3.0,
+        label="Flight",
+        lighting=False,
+    )
 
-    trajectory_line, = ax.plot([], [], [], color="black", linewidth=1.5, label="Flown trajectory")
-    aircraft_point, = ax.plot([], [], [], marker="o", color="black", markersize=5)
-    body_x_line, = ax.plot([], [], [], color="red", linewidth=3.0, label=r"$b_x$")
-    body_y_line, = ax.plot([], [], [], color="green", linewidth=3.0, label=r"$b_y$")
-    body_z_line, = ax.plot([], [], [], color="blue", linewidth=3.0, label=r"$b_z$")
-    body_lines = (body_x_line, body_y_line, body_z_line)
-    time_text = ax.text2D(0.02, 0.97, "", transform=ax.transAxes, va="top")
-    angle_text = ax.text2D(0.02, 0.91, "", transform=ax.transAxes, va="top")
-    ax.legend(loc="upper right")
+    if model_mesh_body is not None:
+        aircraft_actor = plotter.add_mesh(
+            model_mesh_body,
+            color="#3988D1",
+            smooth_shading=True,
+            split_sharp_edges=True,
+            ambient=0.20,
+            diffuse=0.75,
+            specular=0.30,
+            specular_power=25.0,
+            pickable=False,
+        )
+        model_radius = float(np.max(np.linalg.norm(model_mesh_body.points, axis=1)))
+    else:
+        marker_radius = max(0.03 * np.ptp(limit_points, axis=0).max(), 0.05)
+        aircraft_actor = plotter.add_mesh(
+            pv.Sphere(radius=marker_radius), color="#202020", pickable=False
+        )
+        model_radius = marker_radius
+
+    body_axis_actors = []
+    if show_body_axes:
+        for direction, color in zip(np.eye(3), ("red", "green", "blue")):
+            arrow = pv.Arrow(
+                start=(0.0, 0.0, 0.0),
+                direction=direction,
+                scale=axis_length,
+                tip_length=0.18,
+                shaft_radius=0.02,
+                tip_radius=0.05,
+            )
+            body_axis_actors.append(
+                plotter.add_mesh(arrow, color=color, lighting=False, pickable=False)
+            )
+
+    telemetry = plotter.add_text(
+        "",
+        position=(18, 40),
+        font_size=11,
+        color="#202020",
+        name="telemetry",
+    )
+    plotter.add_legend(
+        bcolor=(1.0, 1.0, 1.0),
+        face="rectangle",
+        size=(0.22, 0.10),
+        loc="upper right",
+    )
+
+    minimum = np.min(limit_points, axis=0)
+    maximum = np.max(limit_points, axis=0)
+    center = 0.5 * (minimum + maximum)
+    margin = max(1.5 * model_radius, 1.5 * axis_length if show_body_axes else 0.0, 0.5)
+    half_range = max(0.5 * np.max(maximum - minimum) + margin, 1.0)
+    bounds = (
+        center[0] - half_range,
+        center[0] + half_range,
+        center[1] - half_range,
+        center[1] + half_range,
+        center[2] - half_range,
+        center[2] + half_range,
+    )
+    plotter.show_grid(
+        bounds=bounds,
+        xtitle="North X (m)",
+        ytitle="East Y (m)",
+        ztitle="Altitude -Z_NED (m)",
+        color="#707070",
+        grid="back",
+        location="outer",
+        ticks="outside",
+    )
+
+    camera_distance = 2.6 * half_range
+    view_direction = np.array([0.52, -0.74, 0.42])
+    plotter.camera_position = [
+        center + camera_distance * view_direction,
+        center,
+        (0.0, 0.0, 1.0),
+    ]
+    plotter.camera.clipping_range = (0.01, 10.0 * camera_distance)
 
     def update(sample_index):
         position_now = position[sample_index]
-        trajectory_line.set_data(position[: sample_index + 1, 0], position[: sample_index + 1, 1])
-        trajectory_line.set_3d_properties(position[: sample_index + 1, 2])
-
-        aircraft_point.set_data([position_now[0]], [position_now[1]])
-        aircraft_point.set_3d_properties([position_now[2]])
-
         R_b_to_i = zxy_euler_to_rotation_matrix(euler_deg[sample_index])
-        body_axes_display = ned_to_display(R_b_to_i.T).T
-        for axis_index, line in enumerate(body_lines):
-            endpoint = position_now + axis_length * body_axes_display[:, axis_index]
-            line.set_data(
-                [position_now[0], endpoint[0]],
-                [position_now[1], endpoint[1]],
-            )
-            line.set_3d_properties([position_now[2], endpoint[2]])
+        R_b_to_display = NED_TO_DISPLAY_ROTATION @ R_b_to_i
+        pose_matrix = np.eye(4)
+        pose_matrix[:3, :3] = R_b_to_display
+        pose_matrix[:3, 3] = position_now
+        aircraft_actor.user_matrix = pose_matrix
+        for axis_actor in body_axis_actors:
+            axis_actor.user_matrix = pose_matrix
 
         psi, phi, theta = euler_deg[sample_index]
-        time_text.set_text(f"t = {time[sample_index]:.2f} s")
-        angle_text.set_text(
+        telemetry.input = (
+            f"t = {time[sample_index]:.2f} s\n"
             f"ZXY: psi={psi:.1f} deg, phi={phi:.1f} deg, theta={theta:.1f} deg"
         )
-        return (
-            trajectory_line,
-            aircraft_point,
-            *body_lines,
-            time_text,
-            angle_text,
-        )
 
-    animation = FuncAnimation(
-        fig,
-        update,
-        frames=frame_indices,
-        interval=interval_ms,
-        repeat=repeat,
-        blit=False,
-    )
-    return fig, animation, fps
+    update(int(frame_indices[0]))
+    return {
+        "plotter": plotter,
+        "update": update,
+        "frame_indices": frame_indices,
+        "interval_ms": interval_ms,
+        "fps": fps,
+        "repeat": repeat,
+    }
 
 
-def save_animation(animation, fps, output_path, dpi=120):
-    """将动画保存为 GIF 或 MP4，并给出缺少编码器时的明确提示。"""
+def save_animation(scene, output_path):
+    """使用 PyVista 的 imageio writer 导出 GIF 或 MP4。"""
     output_path = Path(output_path)
     suffix = output_path.suffix.lower()
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    plotter = scene["plotter"]
+    fps = scene["fps"]
     if suffix == ".gif":
-        if not PillowWriter.isAvailable():
-            raise RuntimeError("当前 Matplotlib 环境中 Pillow GIF writer 不可用")
-        writer = PillowWriter(fps=fps)
+        plotter.open_gif(output_path, fps=fps)
     elif suffix == ".mp4":
-        if not FFMpegWriter.isAvailable():
-            raise RuntimeError("保存 MP4 需要先安装 FFmpeg；也可以改用 .gif")
-        writer = FFMpegWriter(fps=fps)
+        plotter.open_movie(output_path, framerate=max(1, int(round(fps))), quality=7)
     else:
         raise ValueError("动画输出仅支持 .gif 或 .mp4 文件")
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    animation.save(output_path, writer=writer, dpi=dpi)
-    print(f"动画已保存到 {output_path}")
+    start = wall_time.perf_counter()
+    for sample_index in scene["frame_indices"]:
+        scene["update"](int(sample_index))
+        plotter.write_frame()
+    elapsed = wall_time.perf_counter() - start
+    frame_count = len(scene["frame_indices"])
+    plotter.close()
+    render_fps = frame_count / elapsed if elapsed > 0.0 else float("inf")
+    print(
+        f"动画已保存到 {output_path}（{frame_count} 帧，"
+        f"平均导出速度 {render_fps:.1f} 帧/秒）"
+    )
+
+
+def show_animation(scene):
+    """通过 VTK 定时器在交互窗口中播放动画。"""
+    plotter = scene["plotter"]
+    frame_indices = scene["frame_indices"]
+
+    def timer_callback(step):
+        scene["update"](int(frame_indices[step % len(frame_indices)]))
+        plotter.render()
+
+    max_steps = 2_147_483_647 if scene["repeat"] else len(frame_indices)
+    plotter.add_timer_event(
+        max_steps=max_steps,
+        duration=max(1, int(round(scene["interval_ms"]))),
+        callback=timer_callback,
+    )
+    plotter.show()
 
 
 def _preset_value(args_value, preset, key, fallback):
@@ -308,6 +439,10 @@ def animate_log(
     stride,
     speed,
     repeat,
+    model_path=DEFAULT_MODEL_PATH,
+    model_scale=1.0,
+    model_origin=None,
+    show_body_axes=False,
     save_path=None,
     dpi=120,
     show=True,
@@ -319,31 +454,50 @@ def animate_log(
             f"找不到仿真日志 {log_path}。请先运行 python validate_paper_trajectories.py"
         )
 
+    model_mesh_body = None
+    if model_path is not None:
+        model_mesh_body, origin_stl, extent_stl = prepare_stl_model(
+            model_path, scale=model_scale, origin_stl=model_origin
+        )
+        print(
+            f"已加载 STL 模型 {model_path}: {model_mesh_body.n_cells} 个三角面, "
+            f"原始尺寸={extent_stl}, STL 原点={origin_stl}, 缩放={model_scale:g}"
+        )
+
     time, position, euler_deg, position_ref = load_flight_log(log_path)
-    fig, animation, fps = create_animation(
-        time,
-        position,
-        euler_deg,
-        position_ref,
-        axis_length=axis_length,
-        stride=stride,
-        speed=speed,
-        repeat=repeat,
-        title=title,
+    window_scale = dpi / 120.0
+    window_size = (
+        max(320, 16 * int(round(69 * window_scale))),
+        max(240, 16 * int(round(57 * window_scale))),
     )
 
+    def build_scene(off_screen):
+        return create_animation(
+            time,
+            position,
+            euler_deg,
+            position_ref,
+            model_mesh_body=model_mesh_body,
+            axis_length=axis_length,
+            stride=stride,
+            speed=speed,
+            repeat=repeat,
+            show_body_axes=show_body_axes,
+            title=title,
+            off_screen=off_screen,
+            window_size=window_size,
+        )
+
     if save_path is not None:
-        save_animation(animation, fps, save_path, dpi=dpi)
+        save_animation(build_scene(off_screen=True), save_path)
 
     if show:
-        plt.show()
-    else:
-        plt.close(fig)
+        show_animation(build_scene(off_screen=False))
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="将 main_sim.py 生成的位置和 ZXY 欧拉角日志绘制为三维动画"
+        description="使用 STL 飞行器模型显示 main_sim.py 生成的三维轨迹与姿态"
     )
     parser.add_argument(
         "log",
@@ -362,7 +516,41 @@ def parse_args():
         action="store_true",
         help="分别导出全部七种论文轨迹动画",
     )
-    parser.add_argument("--axis-length", type=float, default=1.2, help="机体轴显示长度，单位 m")
+    parser.add_argument(
+        "--model",
+        type=Path,
+        default=DEFAULT_MODEL_PATH,
+        help=f"STL 飞行器模型，默认 {DEFAULT_MODEL_PATH.name}",
+    )
+    parser.add_argument(
+        "--no-model",
+        action="store_true",
+        help="不显示 STL 模型，仅显示位置点（用于排查问题）",
+    )
+    parser.add_argument(
+        "--model-scale",
+        type=float,
+        default=1.0,
+        help="STL 模型缩放倍数，默认 1.0",
+    )
+    parser.add_argument(
+        "--model-origin",
+        nargs=3,
+        type=float,
+        metavar=("X", "Y", "Z"),
+        help="STL 坐标中的旋转中心；默认使用模型包围盒中心",
+    )
+    parser.add_argument(
+        "--show-body-axes",
+        action="store_true",
+        help="在 STL 上叠加机体三轴，用于检查模型坐标映射",
+    )
+    parser.add_argument(
+        "--axis-length",
+        type=float,
+        default=1.2,
+        help="--show-body-axes 的机体轴长度，单位 m",
+    )
     parser.add_argument("--stride", type=int, help="抽帧间隔；默认使用各轨迹预设值")
     parser.add_argument("--speed", type=float, help="播放速度倍数；默认使用各轨迹预设值")
     parser.add_argument("--save", type=Path, help="保存为 .gif 或 .mp4")
@@ -378,7 +566,12 @@ def parse_args():
         default="gif",
         help="批量导出格式，默认 gif",
     )
-    parser.add_argument("--dpi", type=int, default=120, help="保存动画的 DPI")
+    parser.add_argument(
+        "--dpi",
+        type=int,
+        default=120,
+        help="输出分辨率缩放基准；120 对应 1104x912",
+    )
     parser.add_argument("--no-repeat", action="store_true", help="播放结束后不循环")
     parser.add_argument("--no-show", action="store_true", help="不打开交互窗口，通常与 --save 合用")
     return parser.parse_args()
@@ -405,6 +598,10 @@ def main():
                 stride,
                 speed,
                 repeat=False,
+                model_path=None if args.no_model else args.model,
+                model_scale=args.model_scale,
+                model_origin=args.model_origin,
+                show_body_axes=args.show_body_axes,
                 save_path=output_path,
                 dpi=args.dpi,
                 show=False,
@@ -434,6 +631,10 @@ def main():
         stride,
         speed,
         repeat=not args.no_repeat,
+        model_path=None if args.no_model else args.model,
+        model_scale=args.model_scale,
+        model_origin=args.model_origin,
+        show_body_axes=args.show_body_axes,
         save_path=args.save,
         dpi=args.dpi,
         show=not args.no_show,
