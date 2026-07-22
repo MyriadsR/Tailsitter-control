@@ -2,3 +2,6 @@
 __pycache__/
 *.pyc
 paper/
+/flight_log*.npz
+/validation_logs/
+/trajectory_animations/
