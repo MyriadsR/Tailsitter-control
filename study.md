@@ -3459,3 +3459,237 @@ $$
 $$
 
 但这三个结论都针对机体系角速度分量 $[p,q,r]$。在尾座悬停和 knife-edge 姿态下，ZXY 欧拉角 Roll/Pitch/Yaw 不能与 $b_x,b_y,b_z$ 简单一一对应。判断某个欧拉角由哪个执行器主导时，还必须结合当前姿态下的欧拉角速度到机体角速度映射。
+
+# 10. 加入风扰对微分平坦推导的影响
+
+结论要分两层看：
+
+1. 如果把风只加在仿真对象，也就是 plant 里，而控制器仍然使用论文的名义模型，那么不会破坏论文中微分平坦推导本身。此时风只是未建模扰动，由 INDI 通过加速度反馈估计并补偿。
+2. 如果把风直接并入控制器的微分平坦模型，把所有地方的速度都替换成相对空气速度，那么原论文的平坦性推导就不再原样成立，需要重新推导包含风场及其导数的模型。
+
+论文中的平坦性推导基于：
+
+$$
+f^i = m(a - g i_z) - f_{\mathrm{ext}}
+$$
+
+并且在求导时使用了外力近似恒定的假设：
+
+$$
+\dot f^i = m j
+$$
+
+代码中对应的是：
+
+```python
+f_dot_i = self.cfg.mass * j_ref
+```
+
+所以，严格来说，论文证明的是“无风或恒定外扰近似下的简化模型”对平坦输出 $[x, y, z, \psi]$ 的关系，而不是完整含风气动模型的全局平坦性。
+
+## 1. 为什么 plant 中加风不破坏控制器推导
+
+论文动力学模型本来就包含外力和外力矩：
+
+$$
+\dot v^i = g i_z + \frac{1}{m}(R_\alpha^i f^\alpha + f_{\mathrm{ext}})
+$$
+
+$$
+\dot \Omega^b = J^{-1}(m^\alpha + m_{\mathrm{ext}} - \Omega^b \times J\Omega^b)
+$$
+
+因此风导致的额外气动力可以放进：
+
+$$
+f_{\mathrm{ext}}, \qquad m_{\mathrm{ext}}
+$$
+
+这样做时，控制器仍然按论文名义模型计算期望姿态和前馈角速度；真实 plant 受到风以后产生的偏差由 INDI 使用实际加速度和角加速度反馈修正。
+
+这也符合论文对 INDI 的定位：气动模型只是局部近似，未建模外力、外力矩和模型误差通过增量反馈处理。
+
+所以推荐的理解是：
+
+$$
+\text{论文名义模型} + \text{风导致的 } f_{\mathrm{ext}},m_{\mathrm{ext}}
+$$
+
+而不是直接把论文名义模型改成完整风场模型。
+
+## 2. 推荐的代码实现方式
+
+参考 `~/rotorpy` 的核心思想即可：风场输出世界系风速，气动力计算使用相对空气速度。
+
+但在这个项目中，为了保持和论文结构一致，不建议把所有 `v_b` 都直接替换成 `v_air_b`。更稳妥的做法是只在 plant 里计算风造成的额外力和力矩：
+
+```python
+wind_i = wind_profile.update(t, pos)          # world frame wind velocity
+
+v_ground_b = R_i_to_b @ vel
+v_air_b = R_i_to_b @ (vel - wind_i)
+
+f_nom_alpha, m_nom_b, R_alpha_to_b = aero.compute_forces_and_moments(
+    v_ground_b, omega1, omega2, delta1, delta2
+)
+
+f_air_alpha, m_air_b, _ = aero.compute_forces_and_moments(
+    v_air_b, omega1, omega2, delta1, delta2
+)
+
+R_alpha_to_i = R_b_to_i @ R_alpha_to_b
+
+f_wind_ext_i = R_alpha_to_i @ (f_air_alpha - f_nom_alpha)
+m_wind_ext_b = m_air_b - m_nom_b
+
+state_dot = dynamics.compute_state_derivatives(
+    t, state,
+    f_nom_alpha,
+    f_wind_ext_i,
+    moments=m_nom_b,
+    m_ext=m_wind_ext_b,
+    R_b_alpha=R_alpha_to_b,
+)
+```
+
+这样总的物理作用等价于使用相对空气速度计算气动力：
+
+$$
+R_\alpha^i f_{\mathrm{air}}^\alpha
+=
+R_\alpha^i f_{\mathrm{nom}}^\alpha
++ f_{\mathrm{wind,ext}}^i
+$$
+
+但代码结构仍然保留论文中的：
+
+$$
+\text{名义 } f^\alpha + \text{外扰 } f_{\mathrm{ext}}
+$$
+
+这对后续分析更清楚，也更容易说明风扰是 INDI 要处理的未建模扰动。
+
+## 3. 控制器里哪些地方不应直接替换成风速
+
+如果目标是验证论文控制器对未知风扰的鲁棒性，以下位置应保持名义模型：
+
+- 平坦性变换仍使用论文的 $f_c^i$、轨迹速度、加速度和 jerk；
+- 前馈角速度仍使用参考轨迹的 $v,a,j$；
+- INDI 里的名义气动力预测仍使用原来的 ground velocity 或参考速度；
+- 控制分配中的速度参数也保持论文原实现。
+
+这样风对控制器来说就是未知扰动。
+
+如果这些位置全部改成相对空气速度，那么控制器就变成“风已知的前馈控制器”。这不是不能做，但已经不是论文原始设定。此时还需要知道：
+
+$$
+v_{\mathrm{air}} = v - w(x,t)
+$$
+
+以及：
+
+$$
+\dot v_{\mathrm{air}} = a - \dot w
+$$
+
+在推导前馈项时还会出现风场的时间导数和空间梯度。若不处理这些项，前馈角速度和 $f_{\dot i}=mj$ 的关系都会不完整。
+
+## 4. 侧向风力不要放进名义 $f^\alpha_y$
+
+论文平坦性条件之一是：
+
+$$
+i_y^\top f^\alpha = 0
+$$
+
+也就是名义气动力和推力合力位于零升力坐标系的 $x$-$z$ 平面内。当前代码中的气动力模型也满足这一点：
+
+```python
+f_T_alpha     = [Fx, 0, Fz]
+f_delta_alpha = [0,  0, Fz]
+f_w_alpha     = [Fx, 0, Fz]
+```
+
+因此，如果为了模拟侧风、侧滑阻力或机身侧向受风而加入 $Y$ 向气动力，不应把它写进共享的名义 `Aerodynamics.compute_forces_and_moments()`，否则会直接破坏论文平坦性推导使用的条件。
+
+更合适的做法是：
+
+$$
+f_{\mathrm{side}}^\alpha
+=
+\begin{bmatrix}
+0 \\
+f_y^\alpha \\
+0
+\end{bmatrix}
+$$
+
+然后转换到世界系并作为 `f_ext` 加入 plant：
+
+$$
+f_{\mathrm{side,ext}}^i = R_\alpha^i f_{\mathrm{side}}^\alpha
+$$
+
+这样论文的名义模型仍满足：
+
+$$
+i_y^\top f^\alpha_{\mathrm{nom}} = 0
+$$
+
+真实 plant 可以不满足这个条件，偏差由 INDI 处理。
+
+## 5. 风扰强度和频率的限制
+
+INDI 可以处理一定范围内的风扰，但不是无限制的。
+
+适合这种方法的风扰包括：
+
+- 常值风；
+- 慢变化风；
+- 中等幅度阵风；
+- 相对控制频率变化较慢的 Dryden 风。
+
+可能明显破坏跟踪效果的情况包括：
+
+- 风变化频率接近或超过滤波器、执行器和控制环带宽；
+- 风导致电机或舵面长时间饱和；
+- 风力足够大，使原轨迹本身在当前执行器约束下不可行；
+- 引入很大的侧向气动力，但仍要求控制器按无侧向名义模型精确前馈。
+
+因此，常值风或慢变风一般可以作为 `f_ext` 处理；强阵风和大侧风则更适合被看作对论文假设的压力测试，而不是论文模型本身已经覆盖的工况。
+
+## 6. 最推荐的实验设置
+
+如果目的是在当前复现工程里加入风扰并评估论文控制器，建议按以下原则实现：
+
+1. 新增一个 `wind_profile`，接口类似 RotorPy：
+
+```python
+wind_i = wind_profile.update(t, position)
+```
+
+2. plant 的真实气动力使用：
+
+```python
+v_air_b = R_i_to_b @ (vel - wind_i)
+```
+
+3. 控制器和平坦性前馈保持原来的名义速度输入。
+
+4. 把风导致的额外力矩差值加入 `f_ext` 和 `m_ext`。
+
+5. 额外记录日志：
+
+```python
+log_wind_i
+log_v_air_b
+log_f_wind_ext_i
+log_m_wind_ext_b
+```
+
+这样论文推导、代码结构和实验解释三者是一致的：
+
+- 论文平坦性：仍针对名义无风模型；
+- 风扰：作为外扰进入真实动力学；
+- INDI：通过反馈估计和补偿风造成的模型误差；
+- 实验结论：可以评价控制器抗风性能，但不能声称完整含风系统仍由原推导证明为微分平坦。

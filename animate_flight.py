@@ -187,6 +187,11 @@ def load_flight_log(path):
             if "position_ref" in data.files
             else None
         )
+        wind_velocity = (
+            np.asarray(data["wind_velocity"], dtype=float)
+            if "wind_velocity" in data.files
+            else None
+        )
 
     if time.ndim != 1:
         raise ValueError("time 必须是一维数组")
@@ -196,12 +201,40 @@ def load_flight_log(path):
         raise ValueError("euler_deg 必须为 N x 3 数组，顺序为 [psi, phi, theta]")
     if position_ref is not None and position_ref.shape != position.shape:
         raise ValueError("position_ref 的形状必须与 position 相同")
+    if wind_velocity is not None and wind_velocity.shape != position.shape:
+        raise ValueError("wind_velocity 的形状必须与 position 相同")
     if time.size < 2:
         raise ValueError("日志至少需要两个时间采样点")
     if not np.all(np.isfinite(position)) or not np.all(np.isfinite(euler_deg)):
         raise ValueError("日志中包含 NaN 或无穷值")
+    if wind_velocity is not None and not np.all(np.isfinite(wind_velocity)):
+        raise ValueError("wind_velocity 中包含 NaN 或无穷值")
 
-    return time, position, euler_deg, position_ref
+    return time, position, euler_deg, position_ref, wind_velocity
+
+
+def vector_arrow_transform(start, vector, length_scale):
+    """生成将 +X 单位箭头放到 start 并对齐、缩放至给定矢量的变换。"""
+    magnitude = float(np.linalg.norm(vector))
+    if magnitude < 1e-9:
+        return None
+
+    x_axis = np.asarray(vector, dtype=float) / magnitude
+    helper = (
+        np.array([0.0, 0.0, 1.0])
+        if abs(x_axis[2]) < 0.9
+        else np.array([0.0, 1.0, 0.0])
+    )
+    y_axis = np.cross(helper, x_axis)
+    y_axis /= np.linalg.norm(y_axis)
+    z_axis = np.cross(x_axis, y_axis)
+
+    transform = np.eye(4)
+    transform[:3, 0] = length_scale * magnitude * x_axis
+    transform[:3, 1] = y_axis
+    transform[:3, 2] = z_axis
+    transform[:3, 3] = start
+    return transform
 
 
 def create_animation(
@@ -218,6 +251,9 @@ def create_animation(
     title="Tailsitter 3D Position and Attitude",
     off_screen=False,
     window_size=(1104, 912),
+    wind_velocity_ned=None,
+    show_wind=True,
+    wind_scale=0.5,
 ):
     """创建 PyVista/VTK 场景；模型网格保持不变，每帧只更新 Actor 变换。"""
     if stride < 1:
@@ -226,10 +262,23 @@ def create_animation(
         raise ValueError("speed 必须大于 0")
     if show_body_axes and axis_length <= 0.0:
         raise ValueError("axis_length 必须大于 0")
+    if show_wind and wind_scale <= 0.0:
+        raise ValueError("wind_scale 必须大于 0")
+    if wind_velocity_ned is not None:
+        wind_velocity_ned = np.asarray(wind_velocity_ned, dtype=float)
+        if wind_velocity_ned.shape != position_ned.shape:
+            raise ValueError("wind_velocity_ned 的形状必须与 position_ned 相同")
+        if not np.all(np.isfinite(wind_velocity_ned)):
+            raise ValueError("wind_velocity_ned 中包含 NaN 或无穷值")
 
     position = ned_to_display(position_ned)
     position_ref = (
         ned_to_display(position_ref_ned) if position_ref_ned is not None else None
+    )
+    wind_velocity = (
+        ned_to_display(wind_velocity_ned)
+        if wind_velocity_ned is not None
+        else None
     )
 
     frame_indices = np.arange(0, time.size, stride, dtype=int)
@@ -301,6 +350,25 @@ def create_animation(
                 plotter.add_mesh(arrow, color=color, lighting=False, pickable=False)
             )
 
+    wind_actor = None
+    if show_wind and wind_velocity is not None:
+        wind_arrow = pv.Arrow(
+            start=(0.0, 0.0, 0.0),
+            direction=(1.0, 0.0, 0.0),
+            scale=1.0,
+            tip_length=0.25,
+            shaft_radius=0.04,
+            tip_radius=0.10,
+        )
+        wind_actor = plotter.add_mesh(
+            wind_arrow,
+            color="#E4572E",
+            label="Wind",
+            lighting=False,
+            pickable=False,
+        )
+        wind_actor.SetVisibility(False)
+
     telemetry = plotter.add_text(
         "",
         position=(18, 40),
@@ -318,7 +386,17 @@ def create_animation(
     minimum = np.min(limit_points, axis=0)
     maximum = np.max(limit_points, axis=0)
     center = 0.5 * (minimum + maximum)
-    margin = max(1.5 * model_radius, 1.5 * axis_length if show_body_axes else 0.0, 0.5)
+    max_wind_length = (
+        wind_scale * float(np.max(np.linalg.norm(wind_velocity, axis=1)))
+        if show_wind and wind_velocity is not None
+        else 0.0
+    )
+    margin = max(
+        1.5 * model_radius,
+        1.5 * axis_length if show_body_axes else 0.0,
+        max_wind_length,
+        0.5,
+    )
     half_range = max(0.5 * np.max(maximum - minimum) + margin, 1.0)
     bounds = (
         center[0] - half_range,
@@ -359,11 +437,29 @@ def create_animation(
         for axis_actor in body_axis_actors:
             axis_actor.user_matrix = pose_matrix
 
+        if wind_actor is not None:
+            wind_transform = vector_arrow_transform(
+                position_now,
+                wind_velocity[sample_index],
+                wind_scale,
+            )
+            wind_actor.SetVisibility(wind_transform is not None)
+            if wind_transform is not None:
+                wind_actor.user_matrix = wind_transform
+
         psi, phi, theta = euler_deg[sample_index]
-        telemetry.input = (
+        telemetry_text = (
             f"t = {time[sample_index]:.2f} s\n"
             f"ZXY: psi={psi:.1f} deg, phi={phi:.1f} deg, theta={theta:.1f} deg"
         )
+        if wind_velocity_ned is not None:
+            wind_ned_now = wind_velocity_ned[sample_index]
+            telemetry_text += (
+                f"\nWind NED: [{wind_ned_now[0]:.2f}, "
+                f"{wind_ned_now[1]:.2f}, {wind_ned_now[2]:.2f}] m/s, "
+                f"|w|={np.linalg.norm(wind_ned_now):.2f} m/s"
+            )
+        telemetry.input = telemetry_text
 
     update(int(frame_indices[0]))
     return {
@@ -373,6 +469,7 @@ def create_animation(
         "interval_ms": interval_ms,
         "fps": fps,
         "repeat": repeat,
+        "wind_actor": wind_actor,
     }
 
 
@@ -443,6 +540,8 @@ def animate_log(
     model_scale=1.0,
     model_origin=None,
     show_body_axes=False,
+    show_wind=True,
+    wind_scale=0.5,
     save_path=None,
     dpi=120,
     show=True,
@@ -464,7 +563,7 @@ def animate_log(
             f"原始尺寸={extent_stl}, STL 原点={origin_stl}, 缩放={model_scale:g}"
         )
 
-    time, position, euler_deg, position_ref = load_flight_log(log_path)
+    time, position, euler_deg, position_ref, wind_velocity = load_flight_log(log_path)
     window_scale = dpi / 120.0
     window_size = (
         max(320, 16 * int(round(69 * window_scale))),
@@ -486,6 +585,9 @@ def animate_log(
             title=title,
             off_screen=off_screen,
             window_size=window_size,
+            wind_velocity_ned=wind_velocity,
+            show_wind=show_wind,
+            wind_scale=wind_scale,
         )
 
     if save_path is not None:
@@ -551,6 +653,17 @@ def parse_args():
         default=1.2,
         help="--show-body-axes 的机体轴长度，单位 m",
     )
+    parser.add_argument(
+        "--no-wind-arrow",
+        action="store_true",
+        help="不显示日志 wind_velocity 对应的风矢量箭头",
+    )
+    parser.add_argument(
+        "--wind-scale",
+        type=float,
+        default=0.5,
+        help="风箭头长度比例，单位 m/(m/s)，默认 0.5",
+    )
     parser.add_argument("--stride", type=int, help="抽帧间隔；默认使用各轨迹预设值")
     parser.add_argument("--speed", type=float, help="播放速度倍数；默认使用各轨迹预设值")
     parser.add_argument("--save", type=Path, help="保存为 .gif 或 .mp4")
@@ -602,6 +715,8 @@ def main():
                 model_scale=args.model_scale,
                 model_origin=args.model_origin,
                 show_body_axes=args.show_body_axes,
+                show_wind=not args.no_wind_arrow,
+                wind_scale=args.wind_scale,
                 save_path=output_path,
                 dpi=args.dpi,
                 show=False,
@@ -635,6 +750,8 @@ def main():
         model_scale=args.model_scale,
         model_origin=args.model_origin,
         show_body_axes=args.show_body_axes,
+        show_wind=not args.no_wind_arrow,
+        wind_scale=args.wind_scale,
         save_path=args.save,
         dpi=args.dpi,
         show=not args.no_show,

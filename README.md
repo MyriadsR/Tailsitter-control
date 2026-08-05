@@ -20,7 +20,8 @@ Tailsitter-control/
 │
 ├── environment/
 │   ├── aerodynamics.py            # φ-theory 合力、力矩及瞬态舵面力
-│   └── dynamics.py                # 四元数六自由度刚体动力学
+│   ├── dynamics.py                # 四元数六自由度刚体动力学
+│   └── wind.py                    # 无风、常值风、正弦阵风和时间窗模型
 │
 ├── trajectory/
 │   ├── __init__.py
@@ -35,7 +36,8 @@ Tailsitter-control/
 │   ├── KnifeEdgeTrasition/        # Fig. 7 风格绘图（目录名沿用现有拼写）
 │   ├── CircleFlight/              # Fig. 8、Fig. 9 风格绘图
 │   ├── CircleTransition/          # Fig. 10 风格绘图
-│   └── DifferentialThrustTurn/    # Fig. 11 风格绘图
+│   ├── DifferentialThrustTurn/    # Fig. 11 风格绘图
+│   └── WindDisturbance/           # 风速、风致外力/力矩和跟踪误差诊断图
 │
 ├── paper/                         # 论文解析文本、页面结构和图片（Git 忽略）
 ├── study.md                       # 论文公式、坐标变换和控制逻辑学习笔记
@@ -212,6 +214,77 @@ python main_sim.py --trajectory knife-edge-transition \
 - `--lap-time`：Lemniscate 与椭圆过渡轨迹；
 - `--speed`：除 `segments` 外的轨迹。对圆周过渡，它表示 3 s 过渡结束时的目标速度。
 
+### 加入风扰
+
+风速采用世界 NED 坐标系，表示空气团相对地面的速度。常值北向风示例：
+
+```bash
+python main_sim.py --trajectory lemniscate --laps 1 \
+  --wind-mode constant --wind-velocity 2.0 0.0 0.0 \
+  --log validation_logs/lemniscate-constant-wind.npz --no-show
+```
+
+在平均风上叠加逐轴同频正弦阵风：
+
+```bash
+python main_sim.py --trajectory lemniscate --laps 1 \
+  --wind-mode sinusoidal --wind-velocity 1.0 0.0 0.0 \
+  --gust-amplitude 0.5 0.3 0.0 --gust-frequency 0.5 \
+  --log validation_logs/lemniscate-gust.npz --no-show
+```
+
+只在指定时间区间加入风扰，例如在 `2.0 ≤ t < 5.0 s` 期间施加常值风：
+
+```bash
+python main_sim.py --trajectory lemniscate --laps 1 \
+  --wind-mode constant --wind-velocity 2.0 0.0 0.0 \
+  --wind-start 2.0 --wind-end 5.0 \
+  --log validation_logs/lemniscate-windowed-wind.npz --no-show
+```
+
+`--wind-start` 默认是 `0 s`，`--wind-end` 默认持续到仿真结束。时间窗采用
+左闭右开的 `[wind_start, wind_end)` 约定，即开始时刻启用、结束时刻关闭。
+
+风扰相关参数：
+
+| 参数 | 含义 | 默认值 |
+|---|---|---|
+| `--wind-mode` | `none`、`constant` 或 `sinusoidal` | `none` |
+| `--wind-velocity WN WE WD` | 常值风或正弦风的平均 NED 风速，单位 m/s | `0 0 0` |
+| `--gust-amplitude GN GE GD` | 正弦阵风的逐轴振幅，单位 m/s | `0 0 0` |
+| `--gust-frequency` | 正弦阵风频率，单位 Hz | `0.5` |
+| `--wind-start` | 风扰开始时刻，包含该时刻，单位 s | `0` |
+| `--wind-end` | 风扰结束时刻，不包含该时刻，单位 s | 仿真结束 |
+
+也可以在 Python 中组合风场，并通过 RotorPy 风格的 `update(t, position)`
+接口传给仿真：
+
+```python
+from environment.wind import ConstantWind, TimeWindowWind
+from main_sim import main
+
+wind = TimeWindowWind(
+    ConstantWind([2.0, 0.0, 0.0]),
+    start_time=2.0,
+    end_time=5.0,
+)
+main(
+    trajectory_name="lemniscate",
+    laps=1,
+    log_path="validation_logs/lemniscate-windowed-wind.npz",
+    show_plot=False,
+    wind_profile=wind,
+)
+```
+
+风只改变真实仿真对象的空速气动力，平坦性变换、控制分配和 INDI
+预测模型仍使用论文的名义地速模型。这样风作为 `f_ext`、`m_ext` 进入动力学，
+可用于检验控制器对未建模扰动的鲁棒性。`--wind-mode none` 为默认值，保持原仿真行为。
+
+当前论文气动力模型的零升力坐标系横向力分量为零，因此侧风不会产生独立的
+侧向阻力；它只会通过现有升力、舵面力和速度模长影响动力学。若要研究强侧风，
+还需要单独辨识并加入侧向气动力系数。
+
 ## 7. NPZ 日志
 
 `main_sim.py` 保存的主要字段包括：
@@ -229,6 +302,10 @@ python main_sim.py --trajectory knife-edge-transition \
 | `angular_acceleration_command` | 指令角加速度 |
 | `rotor_speed` | 两个电机的实际转速 |
 | `flap_deg` | 两个舵面的实际偏角 |
+| `wind_velocity` | 世界 NED 风速，单位 m/s |
+| `body_airspeed` | 机体系空速，单位 m/s |
+| `wind_external_force` | 风导致的世界系外力增量，单位 N |
+| `wind_external_moment` | 风导致的机体系外力矩增量，单位 N·m |
 | `coordinate_frame`, `euler_sequence` | 坐标系和欧拉角顺序元数据 |
 
 每个轨迹应使用独立日志文件，避免默认 `flight_log.npz` 被下一次仿真覆盖。
@@ -237,6 +314,8 @@ python main_sim.py --trajectory knife-edge-transition \
 
 动画使用 PyVista/VTK 的 GPU 渲染管线。STL 网格只在场景创建时上传一次，
 播放时仅更新飞行器 Actor 的 4×4 位姿矩阵，不会逐帧重建三角面。
+如果日志包含 `wind_velocity`，动画默认还会从无人机中心绘制橙色风矢量箭头：
+箭头方向表示世界系风向，箭头长度表示风速大小；风速为零时箭头自动隐藏。
 
 在生成对应日志后，可按预设轨迹直接播放：
 
@@ -259,6 +338,21 @@ python animate_flight.py validation_logs/lemniscate.npz
 python animate_flight.py validation_logs/circle-coordinated.npz \
   --stride 10 --speed 1.5
 ```
+
+可以调整风箭头长度比例，或关闭风箭头：
+
+```bash
+# 每 1 m/s 风速显示为 0.8 m 长的箭头
+python animate_flight.py validation_logs/lemniscate-windowed-wind.npz \
+  --wind-scale 0.8
+
+# 保留其他动画内容，但隐藏风箭头
+python animate_flight.py validation_logs/lemniscate-windowed-wind.npz \
+  --no-wind-arrow
+```
+
+`--wind-scale` 的单位为 `m/(m/s)`，默认值为 `0.5`。旧日志没有
+`wind_velocity` 字段时仍可正常播放，只是不显示风箭头。
 
 默认 STL 旋转中心是模型包围盒中心。如果已知飞行器重心在 STL 坐标中的位置，
 可通过 `--model-origin` 指定；也可以调整模型尺寸或临时显示机体轴：
@@ -295,6 +389,27 @@ MP4 编码器由 `imageio-ffmpeg` 随环境安装。GIF 需要逐帧颜色量化
 ## 9. 生成论文风格结果图
 
 以下程序默认读取 `validation_logs/` 中对应名称的日志，并把图片保存到各自目录。
+这些默认日志名称用于保留无风论文基线；如果有风仿真使用了新的日志文件名，
+需要在绘图命令中显式传入该有风日志。
+
+例如，用指定时间风扰日志生成 Lemniscate 原论文版式的跟踪结果图：
+
+```bash
+python results/Lemniscate/plot_lemniscate_results.py \
+  validation_logs/lemniscate-windowed-wind.npz \
+  --output results/Lemniscate/lemniscate_windowed_wind_results.png
+```
+
+另外提供独立风扰诊断图，不改变 Fig. 6～Fig. 11 的论文子图布局：
+
+```bash
+python results/WindDisturbance/plot_wind_disturbance_results.py \
+  validation_logs/lemniscate-windowed-wind.npz
+```
+
+该图显示世界 NED 风速、风致世界系外力、风致机体系力矩和位置跟踪误差，
+并用浅橙色背景标出检测到的非零风扰时间区间。可使用 `--start`、`--end`
+限制绘图窗口，详细说明见 `results/WindDisturbance/README.md`。
 
 ```bash
 # Fig. 6：Lemniscate

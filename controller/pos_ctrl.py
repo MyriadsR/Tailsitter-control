@@ -2,7 +2,7 @@
 Author: xzr && zhenrxu@qq.com
 Date: 2026-04-08 10:37:39
 LastEditors: xzr && zhenrxu@qq.com
-LastEditTime: 2026-04-16 19:58:30
+LastEditTime: 2026-08-05 09:56:57
 FilePath: /Tailsitter_ws/controller/pos_ctrl.py
 Description: 位置控制器实现
 

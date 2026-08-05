@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 from config import TailsitterConfig
 from environment.dynamics import UAVDynamics
 from environment.aerodynamics import Aerodynamics
+from environment.wind import ConstantWind, NoWind, SinusoidalWind, TimeWindowWind
 
 # 导入所有控制模块
 from controller.pos_ctrl import PositionController
@@ -66,6 +67,7 @@ def main(
     lap_time=None,
     log_path="flight_log.npz",
     show_plot=True,
+    wind_profile=None,
 ):
     print("初始化仿真环境...")
     cfg = TailsitterConfig()
@@ -73,6 +75,7 @@ def main(
     # 实例化环境
     dyn = UAVDynamics(cfg.mass, cfg.inertia_matrix, cfg.g)
     aero = Aerodynamics(cfg)
+    wind_profile = NoWind() if wind_profile is None else wind_profile
     
     # 实例化控制器
     pos_ctrl = PositionController(cfg)
@@ -327,6 +330,8 @@ def main(
     log_angular_acceleration_command = []
     log_rotors, log_flaps = [], []
     log_x_ref, log_v_ref, log_a_ref, log_psi_ref = [], [], [], []
+    log_wind_i, log_v_air_b = [], []
+    log_f_wind_ext_i, log_m_wind_ext_b = [], []
     
     print(f"开始仿真运行，轨迹: {trajectory_name}...")
     for step in range(steps):
@@ -379,6 +384,8 @@ def main(
         m_c = indi_ang.compute_moment_command(omega_dot_c, omega_dot_lpf, m_lpf)
         
         # 6. 控制分配 (推力、力矩 -> 电机转速、舵偏)
+        # 控制器始终使用世界固定地速对应的机体系速度，保持论文中的
+        # 名义模型不变；风只在下面的真实仿真对象中作为未建模扰动出现。
         v_b = R_i_to_b @ vel
         omega_cmd, delta_cmd = allocator.allocate_controls(T_c, m_c, v_b)
         
@@ -394,15 +401,49 @@ def main(
         delta_flaps += np.clip(delta_step, -max_delta_step, max_delta_step)
         delta_flaps = np.clip(delta_flaps, -cfg.delta_max, cfg.delta_max)
         
-        # 7. 物理环境计算真实的受力与力矩
-        f_alpha_real, m_body_real, _ = aero.compute_forces_and_moments(
+        # 7. 物理环境计算风引起的真实气动力/力矩增量。
+        # wind_i 是空气团相对地面的世界 NED 速度，因此飞机相对空气的
+        # 速度为 vel - wind_i。名义结果继续使用地速，二者之差通过论文
+        # Eq. (2)、(4) 中的 f_ext 和 m_ext 注入真实动力学。
+        wind_i = np.asarray(wind_profile.update(t, pos), dtype=float)
+        if wind_i.shape != (3,) or not np.all(np.isfinite(wind_i)):
+            raise ValueError("wind_profile.update() 必须返回有限的三维风速向量")
+        v_air_b = R_i_to_b @ (vel - wind_i)
+
+        f_alpha_nominal, m_body_nominal, _ = aero.compute_forces_and_moments(
             v_b, omega_rotors[0], omega_rotors[1], delta_flaps[0], delta_flaps[1]
         )
-        
+        f_alpha_air, m_body_air, _ = aero.compute_forces_and_moments(
+            v_air_b,
+            omega_rotors[0],
+            omega_rotors[1],
+            delta_flaps[0],
+            delta_flaps[1],
+        )
+        R_alpha_to_i = R_b_to_i @ R_alpha_to_b
+        f_wind_ext_i = R_alpha_to_i @ (f_alpha_air - f_alpha_nominal)
+        m_wind_ext_b = m_body_air - m_body_nominal
+
         # 8. 物理状态积分步进
-        # 假设没有外界阵风扰动 f_ext = 0, m_ext = 0
-        state_dot = dyn.compute_state_derivatives(t, state, f_alpha_real, np.zeros(3), m_body_real, np.zeros(3), R_alpha_to_b)
-        state = rk4_step(dyn, state, f_alpha_real, np.zeros(3), m_body_real, np.zeros(3), R_alpha_to_b, dt)
+        state_dot = dyn.compute_state_derivatives(
+            t,
+            state,
+            f_alpha_nominal,
+            f_wind_ext_i,
+            m_body_nominal,
+            m_wind_ext_b,
+            R_alpha_to_b,
+        )
+        state = rk4_step(
+            dyn,
+            state,
+            f_alpha_nominal,
+            f_wind_ext_i,
+            m_body_nominal,
+            m_wind_ext_b,
+            R_alpha_to_b,
+            dt,
+        )
 
         # 简化地面约束：NED 下 Z>0 代表穿入地面，做硬约束防穿地
         if state[2] > 0.0:
@@ -457,7 +498,6 @@ def main(
 
         # (d) 瞬态襟翼加速度修正 (论文 Eq. 43):
         #     a_tilde_lpf = a_lpf - m^-1 * R_alpha^i * f_delta_hpf^alpha
-        R_alpha_to_i = R_b_to_i @ R_alpha_to_b
         a_lpf_tilde = a_lpf - (1.0 / cfg.mass) * (R_alpha_to_i @ f_delta_hpf)
 
         # 记录日志
@@ -478,6 +518,10 @@ def main(
         log_angular_acceleration_command.append(omega_dot_c.copy())
         log_rotors.append(omega_rotors.copy())
         log_flaps.append(np.rad2deg(delta_flaps))
+        log_wind_i.append(wind_i.copy())
+        log_v_air_b.append(v_air_b.copy())
+        log_f_wind_ext_i.append(f_wind_ext_i.copy())
+        log_m_wind_ext_b.append(m_wind_ext_b.copy())
 
     print("仿真结束，正在绘图...")
     
@@ -499,6 +543,10 @@ def main(
     log_angular_acceleration_command = np.array(log_angular_acceleration_command)
     log_rotors = np.array(log_rotors)
     log_flaps = np.array(log_flaps)
+    log_wind_i = np.array(log_wind_i)
+    log_v_air_b = np.array(log_v_air_b)
+    log_f_wind_ext_i = np.array(log_f_wind_ext_i)
+    log_m_wind_ext_b = np.array(log_m_wind_ext_b)
 
     # 保存独立动画程序所需的时序日志。欧拉角顺序固定为 [psi, phi, theta]，
     # 单位为度；位置采用仿真使用的世界 NED 坐标系。
@@ -521,6 +569,10 @@ def main(
         angular_acceleration_command=log_angular_acceleration_command,
         rotor_speed=log_rotors,
         flap_deg=log_flaps,
+        wind_velocity=log_wind_i,
+        body_airspeed=log_v_air_b,
+        wind_external_force=log_f_wind_ext_i,
+        wind_external_moment=log_m_wind_ext_b,
         coordinate_frame=np.array("NED"),
         euler_sequence=np.array("ZXY"),
     )
@@ -629,7 +681,66 @@ if __name__ == "__main__":
     )
     parser.add_argument("--log", default="flight_log.npz", help="NPZ 日志输出路径")
     parser.add_argument("--no-show", action="store_true", help="仿真后不打开绘图窗口")
+    parser.add_argument(
+        "--wind-mode",
+        choices=("none", "constant", "sinusoidal"),
+        default="none",
+        help="风场类型；风速分量均在世界 NED 坐标系中定义",
+    )
+    parser.add_argument(
+        "--wind-velocity",
+        type=float,
+        nargs=3,
+        metavar=("WN", "WE", "WD"),
+        default=(0.0, 0.0, 0.0),
+        help="常值/平均风速的 NED 三分量 (m/s)",
+    )
+    parser.add_argument(
+        "--gust-amplitude",
+        type=float,
+        nargs=3,
+        metavar=("GN", "GE", "GD"),
+        default=(0.0, 0.0, 0.0),
+        help="正弦阵风振幅的 NED 三分量 (m/s)",
+    )
+    parser.add_argument(
+        "--gust-frequency",
+        type=float,
+        default=0.5,
+        help="正弦阵风频率 (Hz，默认 0.5)",
+    )
+    parser.add_argument(
+        "--wind-start",
+        type=float,
+        default=0.0,
+        help="风扰开始时刻，包含该时刻 (s，默认 0)",
+    )
+    parser.add_argument(
+        "--wind-end",
+        type=float,
+        default=np.inf,
+        help="风扰结束时刻，不包含该时刻 (s，默认持续到仿真结束)",
+    )
     args = parser.parse_args()
+
+    if args.wind_mode == "none":
+        wind_profile = NoWind()
+    elif args.wind_mode == "constant":
+        wind_profile = ConstantWind(args.wind_velocity)
+    else:
+        wind_profile = SinusoidalWind(
+            mean_velocity=args.wind_velocity,
+            amplitude=args.gust_amplitude,
+            frequency_hz=args.gust_frequency,
+        )
+
+    if args.wind_mode != "none":
+        wind_profile = TimeWindowWind(
+            wind_profile,
+            start_time=args.wind_start,
+            end_time=args.wind_end,
+        )
+
     main(
         args.trajectory,
         args.laps,
@@ -637,4 +748,5 @@ if __name__ == "__main__":
         args.lap_time,
         args.log,
         not args.no_show,
+        wind_profile,
     )
