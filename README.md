@@ -410,6 +410,8 @@ python results/WindDisturbance/plot_wind_disturbance_results.py \
 该图显示世界 NED 风速、风致世界系外力、风致机体系力矩和位置跟踪误差，
 并用浅橙色背景标出检测到的非零风扰时间区间。可使用 `--start`、`--end`
 限制绘图窗口，详细说明见 `results/WindDisturbance/README.md`。
+Lemniscate 的 139 组风向、强度、频率和开始相位扫描结果见
+`results/WindDisturbance/lemniscate_wind_limit_report.md`。
 
 ```bash
 # Fig. 6：Lemniscate

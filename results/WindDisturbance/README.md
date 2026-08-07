@@ -43,3 +43,30 @@ python results/WindDisturbance/plot_wind_disturbance_results.py \
 
 原 Fig. 6～Fig. 11 绘图脚本仍保持论文版式，不额外插入风扰子图，但可以
 把有风日志作为输入，以绘制有风条件下的轨迹、误差、姿态和执行器响应。
+
+Lemniscate 常值风、阵风频率和开始相位的跟踪极限扫描结果记录在
+`lemniscate_wind_limit_report.md`。代表性的北向 `8 m/s` 跟踪崩溃结果图为
+`lemniscate_north_8ms_tracking_loss.png`。
+
+## 5–6 m/s 临界区相位敏感性
+
+以下命令运行北向、东向和上升气流在 `5/6 m/s` 下、五个风开启时刻的
+30 组仿真，并生成相位汇总图、对齐风开启时刻的误差响应图和 CSV 指标表：
+
+```bash
+python results/WindDisturbance/plot_lemniscate_phase_sensitivity.py \
+  --run-simulations
+```
+
+仿真日志保存在 `validation_logs/wind_phase_sweep/`。后续只需重新绘图时可以
+省略 `--run-simulations`：
+
+```bash
+python results/WindDisturbance/plot_lemniscate_phase_sensitivity.py
+```
+
+输出文件：
+
+- `lemniscate_phase_sensitivity_summary.png`：RMS/最大误差随风开启时刻变化；
+- `lemniscate_phase_sensitivity_histories.png`：以风开启时刻为零点的误差响应；
+- `lemniscate_phase_sensitivity_metrics.csv`：全部 30 组定量指标和分类。
