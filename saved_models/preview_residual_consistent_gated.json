@@ -1,0 +1,28 @@
+{
+  "algorithm": "PPO",
+  "selection_step": 50000,
+  "artifact_status": "selected deployment model",
+  "timesteps": 50000,
+  "seed": 7,
+  "learning_rate": 0.0003,
+  "residual_limit": 0.5,
+  "training_residual_limit": 0.5,
+  "policy_rate_hz": 50.0,
+  "preview_points": 12,
+  "preview_seconds": 0.6,
+  "preview_channels": 11,
+  "training_trajectories": "default",
+  "trajectory_sampling": "balanced",
+  "downside_multiplier": 2.0,
+  "reward_mode": "balanced-relative-rms",
+  "action": "body-frame acceleration residual [m/s^2]",
+  "residual_feedforward_consistency": true,
+  "residual_filter_cutoff_hz": 10.0,
+  "residual_mode_scales": {
+    "transition-to-hover": 0.0,
+    "differential-turn": 0.0
+  },
+  "deployment_mean_improvement_percent": 3.37037931045629,
+  "deployment_worst_improvement_percent": 0.0,
+  "deployment_selection_score": 3.37037931045629
+}

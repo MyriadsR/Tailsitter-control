@@ -671,3 +671,118 @@
 - coordinated circle：5430 个有限采样点，RMS/最大位置误差为 `0.233/0.279 m`，运行约 `5.95 s`。
 - knife-edge circle：5430 个有限采样点，RMS/最大位置误差为 `8.004/18.908 m`，运行约 `5.84 s`；仍出现 `2500 rad/s` 电机饱和和约 `56.36 deg` 舵面偏转。
 - 相比 2000 Hz，500 Hz 下 differential-turn 与 coordinated circle 的误差只小幅增加；knife-edge circle 的主要问题仍是当前参数/增益导致的执行器饱和，而不是采样频率。
+
+## 2026-08-08：未来轨迹 CNN 一致性残差控制（保留方案）
+
+涉及代码：
+
+- `environment/closed_loop.py`
+- `main_sim.py`
+- `trajectory/factory.py`
+- `learning/preview_features.py`
+- `learning/preview_extractor.py`
+- `learning/residual_env.py`
+- `learning/residual_policy.py`
+- `learning/validation_callback.py`
+- `train_preview_policy.py`
+- `evaluate_preview_policy.py`
+- `plot_training_metrics.py`
+- `plot_validation_metrics.py`
+- `tests/test_residual_feedforward.py`
+- `tests/test_residual_reward.py`
+
+保留资产：
+
+- 部署模型：`saved_models/preview_residual_consistent_gated.zip`
+- 模型配置：`saved_models/preview_residual_consistent_gated.json`
+- 训练指标：`training_logs/preview_residual_consistent/progress.csv`
+- 固定验证：`training_logs/preview_residual_consistent/validation.csv`
+- A/B 数据：`results/PreviewResidual/evaluation_consistent_gated/`
+- 训练图：`results/PreviewResidual/training_metrics_consistent.png`
+- 验证图：`results/PreviewResidual/validation_metrics_consistent.png`
+- 详细报告：`results/PreviewResidual/third_priority_test_report.md`
+
+网络与控制结构：
+
+- 当前状态为 16 维，包括机体系位置、速度和加速度误差、角速度、双电机转速
+  和双舵面位置。
+- 未来 0.6 s 均匀采样 12 个参考点。每个点含机体系未来位置误差、速度、
+  加速度和 yaw 的正余弦，共形成 `11x12` 序列。
+- 预瞄序列经过两层 `Conv1d`，当前状态经过独立 MLP；两支路融合后由 PPO
+  actor 输出三轴归一化动作。
+- 动作以 50 Hz 更新，逐轴映射为不超过 `0.5 m/s^2` 的机体系加速度残差；
+  原平坦性、线/角 INDI 和控制分配继续以 500 Hz 运行。
+- `TailsitterClosedLoop` 使原闭环可以逐步推进，普通零残差仿真保持原解析
+  控制链行为。
+
+训练目标与多轨迹平衡：
+
+- 策略环境和零残差基线使用相同轨迹、初值和仿真参数，奖励直接衡量策略相对
+  基线的位置与速度平方误差改善。
+- 相对改善按基线与策略误差能量之和归一化并裁剪到 `[-1, 1]`，负改善乘
+  `2.0`；另保留较小的动作幅值和动作变化率惩罚。
+- 六类轨迹按标称时长倒数采样，使各类轨迹贡献的 PPO transitions 近似等权。
+- 固定验证每 25k transitions 记录平均改善、最差改善和选择分数：
+
+  ```text
+  selection_score = mean_improvement
+                    + 0.5 * min(worst_improvement, 0)
+  ```
+
+残差前馈一致性：
+
+- 仅把残差加入位置环会改变期望姿态，但原 `omega_ref` 仍使用未修改的参考
+  加速度和 jerk，快速过渡时两条前馈链不一致。
+- 当前实现先把机体系残差变换到惯性系，通过 10 Hz 一阶低通并在 500 Hz 下
+  差分得到残差 jerk：
+
+  ```text
+  delta_a_i_raw = R_b_to_i * delta_a_b
+  delta_a_i     = low_pass(delta_a_i_raw, 10 Hz)
+  delta_j_i     = d(delta_a_i) / dt
+  a_ref_star    = a_ref + delta_a_i
+  j_ref_star    = j_ref + delta_j_i
+  ```
+
+- 同一份 `delta_a_i` 同时加入位置环加速度命令；`a_ref_star` 和
+  `j_ref_star` 用于参考力、参考姿态和 `omega_ref`，使姿态与角速度前馈
+  看到一致的学习补偿。
+- NPZ 日志记录机体系命令残差、实际施加的惯性系残差及残差 jerk。
+
+训练、选择与门控：
+
+- PPO 从头训练 100,000 transitions，实际 rollout 对齐为 `100,352`；
+  seed `7`、学习率 `3e-4`，策略/内环频率为 `50/500 Hz`。
+- 未门控固定验证在 25k/50k/75k/100k 的平均改善分别为
+  `+1.22%/+2.12%/+1.51%/+3.78%`，最差改善分别为
+  `-4.33%/-5.85%/-14.17%/-9.02%`，说明同一平移动作通道仍存在跨模式冲突。
+- 选择 50k checkpoint，因为四个适合加速度残差的模式在该点都得到改善。
+- 部署元数据将 `transition-to-hover` 和 `differential-turn` 的残差比例
+  设为零；全程 circular knife-edge 继续由独立安全门返回零残差。
+
+最终固定 A/B 结果：
+
+| 工况 | 基线 RMS | 策略 RMS | 改善 |
+| --- | ---: | ---: | ---: |
+| Lemniscate | 0.182 m | 0.181 m | +0.57% |
+| 协调圆周 | 0.125 m | 0.114 m | +8.54% |
+| 刀锋过渡 | 0.520 m | 0.514 m | +1.10% |
+| 前飞过渡 | 0.151 m | 0.136 m | +10.01% |
+| 悬停过渡 | 0.142 m | 0.142 m | 0.00%（模式门控） |
+| 差分急转 | 0.755 m | 0.755 m | 0.00%（模式门控） |
+| 全程刀锋圆周 | 2.941 m | 2.941 m | 0.00%（安全门控） |
+
+六个部署工况平均位置 RMS 改善为 `+3.370379%`，最差改善为 `0.00%`，
+选择分数为 `+3.370379`。七个评估工况的电机和舵面饱和占比均为零。
+
+项目清理与复验：
+
+- 删除其他学习模型、checkpoint、Monitor 数据、评估 NPZ/JSON、图表和独立
+  报告，删除增强观测、动力学随机化及鲁棒性比较专用代码。
+- 平衡采样、相对 RMS 奖励和最差工况选择保留，因为它们是当前训练流程的
+  必要组成部分，而不是可独立移除的旧实验分支。
+- 清理后 `7` 个单元测试全部通过，Gymnasium `check_env` 通过，所有 Python
+  文件通过 `compileall`。
+- 使用保留模型重新运行完整七工况 A/B，新旧 `summary.json` 的 SHA-256
+  均为 `3e78d09e42c0931c34fcd9d1c27d6109abdda12af64a6eec2a5aaba71361dce9`。
+- 两张保留图由当前 CSV 重新生成后与保留文件哈希一致。

@@ -7,6 +7,8 @@
 ```text
 Tailsitter-control/
 ├── main_sim.py                    # 闭环仿真入口、执行器动态、INDI 滤波与日志保存
+├── train_preview_policy.py        # 未来轨迹 CNN 残差策略训练入口
+├── evaluate_preview_policy.py     # 基线/CNN 六工况 A/B 评估
 ├── config.py                      # 质量、惯量、几何、气动、执行器和控制增益
 ├── animate_flight.py              # 位置与姿态的三维动画
 ├── vis_vtol.stl                   # 三维动画使用的尾座飞行器模型
@@ -20,7 +22,14 @@ Tailsitter-control/
 │
 ├── environment/
 │   ├── aerodynamics.py            # φ-theory 合力、力矩及瞬态舵面力
-│   └── dynamics.py                # 四元数六自由度刚体动力学
+│   ├── dynamics.py                # 四元数六自由度刚体动力学
+│   └── closed_loop.py             # 可逐步调用的完整闭环仿真核心
+│
+├── learning/
+│   ├── preview_features.py        # 状态与未来参考的机体系观测
+│   ├── preview_extractor.py       # 未来序列 Conv1d 与状态 MLP 双支路
+│   ├── residual_env.py            # 50 Hz Gymnasium/PPO 训练环境
+│   └── residual_policy.py         # 已训练模型的 500 Hz 仿真适配器
 │
 ├── trajectory/
 │   ├── __init__.py
@@ -48,6 +57,7 @@ Tailsitter-control/
 
 ```text
 参考位置、速度、加速度、jerk、yaw
+                  ├── 未来 0.6 s Conv1d ── 受限 Δa_body（可选）
                   ↓
       位置/速度 PD（Eq. 41）
                   ↓
@@ -101,6 +111,9 @@ conda activate vtol_sim
 - Matplotlib
 - PyVista / VTK
 - ImageIO / ImageIO-FFmpeg
+- PyTorch CPU
+- Gymnasium
+- Stable-Baselines3
 
 也可以指定环境名或重新创建环境：
 
@@ -292,7 +305,73 @@ python animate_flight.py --all-trajectories \
 MP4 编码器由 `imageio-ffmpeg` 随环境安装。GIF 需要逐帧颜色量化，批量导出时
 通常 MP4 更快、文件也更小。完整参数可通过 `python animate_flight.py --help` 查看。
 
-## 9. 生成论文风格结果图
+## 9. 未来轨迹 CNN 残差控制
+
+当前保留的学习控制器不替换解析控制链。原有平坦性与 INDI 控制器仍以
+500 Hz 运行，PPO 策略以 50 Hz 输出逐轴限幅 `0.5 m/s^2` 的机体系加速度
+残差。未来 0.6 s 的 12 个位置、速度、加速度和 yaw 参考点组成 `11x12`
+序列，经两层 `Conv1d` 编码；16 维当前状态由独立 MLP 编码。
+
+为避免期望姿态和角速度前馈不一致，机体系残差变换到惯性系并经 10 Hz
+低通后，同时加入位置环加速度命令和参考加速度；其差分得到的残差 jerk
+同时加入参考 jerk。训练使用相同初值的零残差基线、归一化相对 RMS 奖励、
+逆轨迹时长采样和最差工况 checkpoint 评分。
+
+从头训练同一网络、奖励和控制配置（PPO 随机训练不保证复现当前 50k
+checkpoint，仍需根据固定多工况验证选择模型）：
+
+```bash
+python train_preview_policy.py \
+  --timesteps 100000 \
+  --n-envs 4 \
+  --learning-rate 3e-4 \
+  --output saved_models/preview_residual_consistent_retrain \
+  --log-dir training_logs/preview_residual_consistent_retrain
+```
+
+项目保留的部署模型是固定验证选择出的 50k checkpoint，并带有模式门控：
+`transition-to-hover` 和 `differential-turn` 的残差比例为零；全程 circular
+knife-edge 使用独立安全门返回零残差。模型和控制配置位于：
+
+- `saved_models/preview_residual_consistent_gated.zip`
+- `saved_models/preview_residual_consistent_gated.json`
+
+在单条轨迹中启用模型：
+
+```bash
+python main_sim.py --trajectory transition-to-forward \
+  --preview-model saved_models/preview_residual_consistent_gated.zip \
+  --log validation_logs/transition-to-forward-preview.npz --no-show
+```
+
+对七个代表工况运行相同初值的解析基线/CNN A/B 评估：
+
+```bash
+python evaluate_preview_policy.py \
+  saved_models/preview_residual_consistent_gated.zip \
+  --output-dir results/PreviewResidual/evaluation_consistent_gated
+```
+
+保留结果中，Lemniscate、协调圆周、刀锋过渡和前飞过渡的位置 RMS 分别改善
+`0.57%`、`8.54%`、`1.10%` 和 `10.01%`；其余模式由门控保持基线。六个部署
+工况平均改善 `3.370379%`，最差改善 `0.00%`，七个评估工况均无电机或舵面
+饱和。详细报告和逐工况 NPZ 数据位于 `results/PreviewResidual/`。
+
+重新绘制保留的训练和固定验证指标：
+
+```bash
+python plot_training_metrics.py training_logs/preview_residual_consistent \
+  --output results/PreviewResidual/training_metrics_consistent.png
+
+python plot_validation_metrics.py \
+  training_logs/preview_residual_consistent \
+  --output results/PreviewResidual/validation_metrics_consistent.png
+```
+
+该策略只在当前仿真与参数分布内验证，不能直接作为真机安全验证。改变残差
+限幅、模式门控、观测布局或动力学参数后必须重新执行完整 A/B 测试。
+
+## 10. 生成论文风格结果图
 
 以下程序默认读取 `validation_logs/` 中对应名称的日志，并把图片保存到各自目录。
 
@@ -325,7 +404,7 @@ python results/Lemniscate/plot_lemniscate_results.py \
 
 每个结果目录中的 `README.md` 记录了对应子图、时间窗口和专用参数。
 
-## 10. 参数与复现范围
+## 11. 参数与复现范围
 
 `config.py` 中部分参数来自论文，部分参数根据论文图表、飞行器尺寸和执行器信息估算。论文没有公开所有台架数据、惯量、几何臂长及原始轨迹解析式，因此本项目不是作者飞行代码和参数的逐字复制。
 

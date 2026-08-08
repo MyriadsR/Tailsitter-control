@@ -47,6 +47,8 @@ PIP_PACKAGES=(
     "pyvista>=0.46,<0.49"
     "imageio"
     "imageio-ffmpeg"
+    "gymnasium>=1.2,<2"
+    "stable-baselines3>=2.7,<3"
 )
 
 if ! command -v conda >/dev/null 2>&1; then
@@ -78,6 +80,7 @@ conda activate "${ENV_NAME}"
 if [[ ${#PIP_PACKAGES[@]} -gt 0 ]]; then
     echo "[INFO] Installing pip packages into ${ENV_NAME}"
     python -m pip install --upgrade pip
+    python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
     python -m pip install "${PIP_PACKAGES[@]}"
 fi
 

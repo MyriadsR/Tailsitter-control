@@ -5,3 +5,13 @@ paper/
 /flight_log*.npz
 /validation_logs/
 /trajectory_animations/
+/2566/
+/saved_models/*
+!/saved_models/preview_residual_consistent_gated.zip
+!/saved_models/preview_residual_consistent_gated.json
+/preview_results*/
+/training_logs/*
+!/training_logs/preview_residual_consistent/
+/training_logs/preview_residual_consistent/*
+!/training_logs/preview_residual_consistent/progress.csv
+!/training_logs/preview_residual_consistent/validation.csv
