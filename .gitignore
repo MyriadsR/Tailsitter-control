@@ -5,3 +5,6 @@ paper/
 /flight_log*.npz
 /validation_logs/
 /trajectory_animations/
+/paper_control/
+/paper_planning/
+/paper_manifold/

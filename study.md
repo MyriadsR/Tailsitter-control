@@ -1,3 +1,35 @@
+# 目录
+
+- [1. 代码中关于式 (34) 的等价写法的解释](#section-1)
+- [2. 为什么 $\phi$ 会主要由电机差速产生](#section-2)
+- [3. 微分平坦条件二的含义](#section-3)
+- [4. 刀锋飞行跟踪效果差](#section-4)
+- [5. 电机和舵机一阶动态代码解释](#section-5)
+- [6. INDI 中加速度滤波与执行器滤波的关系](#section-6)
+- [7. 双电机总推力与差分推力的可行分配](#section-7)
+- [8. Knife-Edge Transition 跟踪变差的原因与调参验证](#section-8)
+- [9. 飞行器三轴控制效率比较](#section-9)
+- [10. 使用 GCOPTER 实现 2554 论文的尾座式轨迹规划](#section-10)
+  - [10.1 总体结论](#section-10-1)
+  - [10.2 可以直接复用的部分](#section-10-2)
+  - [10.3 必须替换的部分](#section-10-3)
+  - [10.4 执行器约束设计](#section-10-4)
+  - [10.5 Snap 约束对梯度计算的额外要求](#section-10-5)
+  - [10.6 “硬约束”的准确含义](#section-10-6)
+  - [10.7 推荐的软件结构](#section-10-7)
+  - [10.8 最终判断](#section-10-8)
+- [11. SplineTrajectory 与 GCOPTER 的区别及选型](#section-11)
+  - [11.1 核心区别](#section-11-1)
+  - [11.2 功能对比](#section-11-2)
+  - [11.3 SplineTrajectory 相对 MINCO 实现的改进](#section-11-3)
+  - [11.4 对当前尾座式项目的意义](#section-11-4)
+  - [11.5 位置与 yaw 的样条组织方式](#section-11-5)
+  - [11.6 两种推荐方案](#section-11-6)
+  - [11.7 与硬约束的关系](#section-11-7)
+  - [11.8 最终建议](#section-11-8)
+
+<a id="section-1"></a>
+
 # 1. 代码中关于式 (34) 的等价写法的解释
 
 这里的代码逻辑是正确的。它与论文式 (34) 的外观不同，是因为代码用输运定理把式中的 $\dot R_i^\phi$ 消掉了；两者数学上完全等价。
@@ -172,6 +204,8 @@ $$
 - $\theta$：绕经过前两次旋转后的中间 $y$ 轴旋转。
 
 所以图例写成 Roll/Pitch/Yaw 便于阅读，但它们不总是分别等于绕当前机体 $(b_x,b_y,b_z)$ 的旋转。
+
+<a id="section-2"></a>
 
 # 2. 为什么 $\phi$ 会主要由电机差速产生
 
@@ -578,6 +612,8 @@ $$
 
 最后，项目使用 ZXY 而不是常见的 ZYX 欧拉角还有一个重要原因：传统 ZYX 在尾座飞行的 $\theta\approx\pm90^\circ$ 处会发生俯仰奇异，而 ZXY 把奇异位置转移到了 $\phi=\pm90^\circ$。当前图中 $\phi$ 只有约 $\pm10^\circ$，因此尾座悬停附近仍可正常表示。
 
+<a id="section-3"></a>
+
 # 3. 微分平坦条件二的含义
 
 这里混淆了三件不同的事情：
@@ -897,6 +933,8 @@ $$
 - 世界 $Y$ 向速度、加速度和力可以非零；
 - 侧向飞行是通过旋转飞机的 $x$-$z$ 受力平面实现的，并没有违反微分平坦性推导的前提。
 
+
+<a id="section-4"></a>
 
 # 4. 刀锋飞行跟踪效果差
 论文中的刀锋圆周跟踪好，而且两台电机存在差速，这两件事并不矛盾。关键是要把”总推力”和”差分推力”的作用分开。
@@ -1222,6 +1260,8 @@ $$
 而不能只配平总推力和 $c_{\mu T}$ 俯仰力矩。把 $c_{\mu T}$ 临时改成零虽然会让仿真变好，但只是删除了真实的舵面—俯仰—平动力耦合，不是论文控制算法的正确复现。
 
 
+<a id="section-5"></a>
+
 # 5. 电机和舵机一阶动态代码解释
 
 对应代码如下：
@@ -1497,6 +1537,8 @@ log_flaps.append(delta_flaps.copy())
 
 这样每个时刻保存的都是独立快照。
 
+
+<a id="section-6"></a>
 
 # 6. INDI 中加速度滤波与执行器滤波的关系
 
@@ -2067,6 +2109,8 @@ $$
 满足这两点时，INDI 中“测得的响应减去模型预测的响应”才主要代表真实的模型误差和外部扰动，而不会被滤波器自身的相位差或重复计算的舵面瞬态污染。
 
 
+<a id="section-7"></a>
+
 # 7. 双电机总推力与差分推力的可行分配
 
 对应代码为：
@@ -2591,6 +2635,8 @@ $$
 这保证了饱和后的控制分配仍然保持代数与物理上的自洽。
 
 
+<a id="section-8"></a>
+
 # 8. Knife-Edge Transition 跟踪变差的原因与调参验证
 
 在增加执行器动态并把飞行器参数改为论文平台参数之后，knife-edge-transition 跟踪变差并不是主要由 `alpha_T=-5 deg` 单独造成的。受控消融表明，主要因素是 `c_mu_T=-0.025 m` 引入的动态俯仰配平负担，以及电机和舵机延迟；两者影响相当且相互耦合。
@@ -3006,6 +3052,8 @@ $$
 
 为了获得更好曲线而直接令 `alpha_T` 或 `c_mu_T` 为零，并不是论文飞行器的正确复现方式。
 
+
+<a id="section-9"></a>
 
 # 9. 飞行器三轴控制效率比较
 
@@ -3459,3 +3507,644 @@ $$
 $$
 
 但这三个结论都针对机体系角速度分量 $[p,q,r]$。在尾座悬停和 knife-edge 姿态下，ZXY 欧拉角 Roll/Pitch/Yaw 不能与 $b_x,b_y,b_z$ 简单一一对应。判断某个欧拉角由哪个执行器主导时，还必须结合当前姿态下的欧拉角速度到机体角速度映射。
+
+<a id="section-10"></a>
+
+# 10. 使用 GCOPTER 实现 2554 论文的尾座式轨迹规划
+
+<a id="section-10-1"></a>
+
+## 10.1 总体结论
+
+[GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) 可以作为 2554 论文轨迹规划算法的优化框架。它适合复用的核心是 MINCO 稀疏多项式参数化、空间和时间变量映射、约束积分、梯度传播及 L-BFGS 优化器，而不是现成的多旋翼动力学和平坦映射。
+
+经过尾座式适配后，优化器可以联合优化：
+
+- 轨迹的中间位置或走廊内控制点；
+- yaw 轨迹；
+- 每个多项式段的持续时间；
+- 位置 Minimum-Snap 与 yaw Minimum-Acceleration 代价；
+- 单电机推力、单舵面偏角等执行器约束；
+- 速度、安全走廊和其他运动学、动力学约束。
+
+因此，它可以把 2554 原来的两层流程
+
+```text
+先生成 Minimum-Snap 轨迹
+        ↓
+再统一缩放轨迹时间并检查执行器可行性
+```
+
+改造成联合时空优化：
+
+```text
+同时改变轨迹形状、中间位置、yaw 和各段时间
+        ↓
+通过尾座式完整平坦变换计算执行器需求
+        ↓
+最小化平滑度代价、总时间和约束违反代价
+```
+
+但是不能直接调用 GCOPTER 当前的 `GCOPTER_PolytopeSFC` 得到符合 2554 的结果。其官方示例是多旋翼模型，平坦输出和执行器都与尾座式飞翼不同，必须替换核心平坦映射和约束函数。
+
+<a id="section-10-2"></a>
+
+## 10.2 可以直接复用的部分
+
+GCOPTER 中以下模块可以保留：
+
+1. MINCO 稀疏轨迹参数化；
+2. 中间位置点优化；
+3. 安全飞行走廊参数化；
+4. 每段时间 $T_i>0$ 的无约束变量变换；
+5. 轨迹能量对中间点和时间的解析梯度传播；
+6. 在轨迹段内通过数值积分评估状态和输入约束；
+7. L-BFGS 优化框架及初始化方法。
+
+GCOPTER 的典型决策变量可以写成：
+
+$$
+z=
+\begin{bmatrix}
+\tau_1&\cdots&\tau_M&
+\xi_1^\top&\cdots&\xi_N^\top
+\end{bmatrix}^\top
+$$
+
+其中：
+
+- $\tau_i$ 经光滑映射变成正的分段时间 $T_i$；
+- $\xi_i$ 经空间映射变成安全走廊中的中间位置点；
+- 多项式系数由 MINCO 根据中间点和时间解析消元，不需要全部作为优化变量。
+
+时间代价可直接加入目标函数：
+
+$$
+J_T=\rho_T\sum_{i=1}^{M}T_i
+$$
+
+因此 GCOPTER 确实能够同时优化空间轨迹和各段时间，而不是只能在轨迹生成完成后统一缩放总时间。
+
+对应源码：
+
+- [时空决策变量及优化流程](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/gcopter.hpp#L2688-L2753)
+- [正时间变量映射](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/gcopter.hpp#L2035-L2077)
+
+<a id="section-10-3"></a>
+
+## 10.3 必须替换的部分
+
+### 10.3.1 位置改用 S4 MINCO
+
+2554 对位置使用 Minimum-Snap 目标：
+
+$$
+J_x=\int_0^T\left\|\mathbf x^{(4)}(t)\right\|^2dt
+$$
+
+因此位置应该使用 `MINCO_S4NU`，对应七次分段多项式。GCOPTER 仓库已经包含这一实现：
+
+- [MINCO_S4NU](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/minco.hpp#L3308-L3349)
+
+它与 2554 所需的轨迹连续性相符：位置至少需要四阶连续，才能使理想控制输入连续并可用于执行器可行性分析。
+
+### 10.3.2 yaw 改用 S2 MINCO
+
+2554 对 yaw 使用 Minimum-Acceleration 目标：
+
+$$
+J_\psi=\mu_\psi\int_0^T\ddot\psi^2(t)dt
+$$
+
+因此 yaw 应使用一维 `MINCO_S2NU`，对应三次分段多项式：
+
+- [MINCO_S2NU](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/minco.hpp#L2535-L2569)
+
+位置和 yaw 两个 MINCO 对象必须共享同一组分段时间 $T_i$。完整目标函数可以写为：
+
+$$
+J=
+\int_0^T
+\left(
+\left\|\mathbf x^{(4)}\right\|^2+
+\mu_\psi\ddot\psi^2
+\right)dt
++\rho_T\sum_iT_i
++J_{\mathrm{constraint}}
+$$
+
+实现时还要对 yaw 进行连续展开，不能直接在 $[-\pi,\pi)$ 中优化，否则经过 $\pi$ 边界时会产生人为跳变。优化结束后再将输出角度回绕到需要的显示范围。
+
+### 10.3.3 替换多旋翼平坦映射
+
+GCOPTER 当前的 `FlatnessMap::forward()` 接收：
+
+$$
+(\mathbf v,\mathbf a,\mathbf j,\psi,\dot\psi)
+$$
+
+并返回多旋翼的总推力、姿态四元数和角速度：
+
+$$
+(T,\mathbf q,\pmb\Omega)
+$$
+
+对应源码：
+
+- [多旋翼 flatness.hpp](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/flatness.hpp#L827-L841)
+
+2554 的尾座式完整平坦映射必须接收更高阶导数：
+
+$$
+\left(
+\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi
+\right)
+$$
+
+并计算：
+
+$$
+\left(
+\mathbf q,T,\pmb\Omega,\dot{\pmb\Omega},
+T_1,T_2,\delta_1,\delta_2
+\right)
+$$
+
+建议新增独立模块：
+
+```cpp
+class TailsitterFlatnessMap
+{
+public:
+    void forward(...);
+    void backward(...);
+};
+```
+
+其中 `forward()` 实现 2554 的式 (21)～(56)，`backward()` 将执行器约束的梯度反向传播到：
+
+$$
+\mathbf x,\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi
+$$
+
+然后 MINCO 再把这些梯度传播到中间位置点、yaw 节点和分段时间。
+
+GCOPTER 当前约束计算虽然已经算出 Snap，但只把 $\mathbf v,\mathbf a,\mathbf j$ 送入多旋翼平坦映射，而且示例把 $\psi$ 和 $\dot\psi$ 都设为零：
+
+- [现有约束采样和平坦映射调用](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/gcopter.hpp#L2553-L2582)
+
+所以现有平坦映射不能直接用于尾座式规划。
+
+### 10.3.4 处理姿态分支和奇异点
+
+2554 的平坦变换包含 `atan2`、$k\pi$ 姿态分支和若干分母。梯度优化要求目标函数在局部尽可能光滑，因此需要：
+
+- 对 yaw 使用连续展开值；
+- 在一次局部优化过程中保持姿态分支连续；
+- 根据正推力和相邻姿态连续性选择 $k$；
+- 对平坦变换分母加入奇异性裕度约束；
+- 在分支切换或奇异点附近重新初始化，而不是强行使用不连续梯度。
+
+这是将 GCOPTER 用于尾座式飞翼时最主要的数值困难之一。
+
+<a id="section-10-4"></a>
+
+## 10.4 执行器约束设计
+
+GCOPTER 官方示例的幅值边界是：
+
+$$
+[v_{\max},\Omega_{\max},\theta_{\max},T_{\min},T_{\max}]
+$$
+
+对应的是多旋翼速度、机体角速度、倾角和总推力约束：
+
+- [官方 magnitudeBounds 定义](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/gcopter.hpp#L2441-L2493)
+
+尾座式至少应替换为四个单执行器约束：
+
+$$
+\begin{aligned}
+T_{\min}&\leq T_1(t)\leq T_{\max}\\
+T_{\min}&\leq T_2(t)\leq T_{\max}\\
+-\delta_{\max}&\leq\delta_1(t)\leq\delta_{\max}\\
+-\delta_{\max}&\leq\delta_2(t)\leq\delta_{\max}
+\end{aligned}
+$$
+
+规划器中最好直接约束单电机推力，而不是先计算转速：
+
+$$
+T_i=c_T\omega_i^2
+$$
+
+因此转速限制可以等价转换为：
+
+$$
+c_T\omega_{\min}^2
+\leq T_i\leq
+c_T\omega_{\max}^2
+$$
+
+这样可以避免平方根在 $T_i\rightarrow0$ 附近产生较差梯度，也能在 $T_i<0$ 时直接得到明确的约束违反量。
+
+建议同时加入：
+
+- 舵面分配矩阵行列式或最小奇异值裕度；
+- 总推力与差分推力的联合可行域；
+- 舵面角速度 $|\dot\delta_i|$ 限制；
+- 电机推力变化率或转速变化率限制；
+- 平坦变换奇异性裕度；
+- 速度、空间走廊和姿态连续性约束。
+
+规划评估必须使用未限幅的原始 $T_i$ 和 $\delta_i$。不能复用当前会执行电机截断和有界舵面分配的在线控制分配器，否则限幅会隐藏原本不可行的轨迹。
+
+<a id="section-10-5"></a>
+
+## 10.5 Snap 约束对梯度计算的额外要求
+
+尾座式执行器输入依赖 Snap：
+
+$$
+\mathbf u=
+F(\mathbf x,\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi)
+$$
+
+当约束依赖 $\mathbf s=\mathbf x^{(4)}$ 时，对积分节点时间求梯度还需要五阶位置导数：
+
+$$
+\frac{d\mathbf s}{dt}=\mathbf x^{(5)}
+$$
+
+因此新的约束积分代码需要计算：
+
+$$
+\mathbf x,\mathbf v,\mathbf a,\mathbf j,
+\mathbf s,\mathbf x^{(5)}
+$$
+
+也就是在当前 `beta0`～`beta4` 的基础上增加 `beta5`：
+
+```cpp
+snap    = coeff.transpose() * beta4;
+crackle = coeff.transpose() * beta5;
+```
+
+同理，执行器约束依赖 $\ddot\psi$ 时，对时间变量求梯度还需要：
+
+$$
+\psi^{(3)}
+$$
+
+七次位置多项式和三次 yaw 多项式都能够提供这些导数。
+
+<a id="section-10-6"></a>
+
+## 10.6 “硬约束”的准确含义
+
+GCOPTER 的论文和 README 将其描述为支持用户定义的状态—输入约束，但官方示例代码实际通过采样积分和平滑 L1 罚函数将约束违反加入目标函数：
+
+$$
+J_{\mathrm{constraint}}
+=
+\int_0^T
+P\bigl(g(\mathbf u(t))\bigr)dt
+$$
+
+源码在有限个积分节点上计算速度、角速度、倾角和推力违反量，并将其作为 penalty：
+
+- [约束罚函数实现](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/gcopter.hpp#L2531-L2656)
+
+所以官方实现并不是传统约束非线性规划意义上的绝对硬约束，仍可能发生：
+
+- 罚权不够时存在少量越界；
+- 两个积分采样点之间出现未检测到的峰值；
+- 优化终止容差留下残余违反；
+- 姿态分支切换导致局部约束不光滑。
+
+如果使用原始 GCOPTER 罚函数框架，工程上应采取：
+
+1. 使用足够高但不过度恶化条件数的罚权；
+2. 对电机和舵面限值预留约 $5\%$～$15\%$ 裕度；
+3. 优化结束后用远高于积分分辨率的采样重新验证；
+4. 在发现越界的时间区间自适应增加积分节点；
+5. 验证失败时重新优化或放大局部时间。
+
+如果要求严格硬约束，应保留 MINCO 参数化和平坦映射，但把外层求解器改成：
+
+- 增广拉格朗日；
+- SQP；
+- IPOPT 等带显式不等式约束的非线性规划器。
+
+即便使用显式硬约束求解器，连续时间约束通常仍要通过稠密采样、自适应加点或优化后认证来保证采样点之间不超限。
+
+<a id="section-10-7"></a>
+
+## 10.7 推荐的软件结构
+
+建议把 GCOPTER 适配层与当前 2566 闭环控制器解耦：
+
+```text
+航点、导数约束和安全走廊
+                ↓
+位置 MINCO-S4 + yaw MINCO-S2
+                ↓
+联合优化变量：
+中间位置、yaw 节点、各段时间
+                ↓
+x,v,a,j,snap,ψ,ψ̇,ψ̈
+                ↓
+2554 尾座式完整平坦变换
+                ↓
+原始 T1、T2、δ1、δ2
+                ↓
+执行器约束代价及反向梯度
+                ↓
+L-BFGS / 增广拉格朗日 / SQP
+                ↓
+优化后高密度可行性验证
+                ↓
+只把 x,v,a,j,ψ,ψ̇
+交给现有 2566 闭环控制器
+```
+
+推荐新增模块如下：
+
+```text
+planner/
+├── minco_position_s4.*       # 三维位置 Minimum-Snap
+├── minco_yaw_s2.*            # 一维 yaw Minimum-Acceleration
+├── tailsitter_flatness.*     # 2554 式 (21)～(56)
+├── actuator_constraints.*    # 原始单执行器约束及梯度
+├── trajectory_optimizer.*    # 时空联合优化
+└── feasibility_validator.*   # 高密度独立验证
+```
+
+规划器输出可以包含完整高阶参考：
+
+```text
+x, v, a, jerk, snap, psi, psi_dot, psi_ddot
+```
+
+但当前 2566 控制器仍然只需要：
+
+```text
+x, v, a, jerk, psi, psi_dot
+```
+
+Snap 和 $\ddot\psi$ 主要用于规划阶段的开环执行器预测与可行性约束，不应直接取代现有的角加速度 INDI 闭环。
+
+<a id="section-10-8"></a>
+
+## 10.8 最终判断
+
+GCOPTER 很适合作为 2554 轨迹规划算法的新优化后端，并且能够联合优化轨迹位置和分段时间。其优势是：
+
+- 通过 MINCO 消除大量多项式系数决策变量；
+- 能够直接优化中间位置和时间；
+- 容易加入安全走廊；
+- 支持基于平坦映射的用户自定义状态和输入约束；
+- 比传统全状态直接配点更适合实时或准实时规划。
+
+但这里的“使用 GCOPTER”应理解为：
+
+$$
+\boxed{
+\text{复用 MINCO、时空参数化、梯度传播和优化器}
+}
+$$
+
+而不是：
+
+$$
+\boxed{
+\text{直接使用现成的多旋翼 GCOPTER 规划器}
+}
+$$
+
+真正的主要开发工作是：
+
+1. 实现 2554 的尾座式完整平坦映射；
+2. 实现该映射的稳定解析梯度或自动微分版本；
+3. 增加独立 yaw 轨迹并与位置共享时间；
+4. 将总推力约束改成双电机、双舵面的单执行器约束；
+5. 处理姿态分支、奇异点和连续时间可行性验证。
+
+完成这些适配后，优化所得轨迹仍应交给当前基于 2566 的 PD+INDI 控制器跟踪，而不是把 2554 预测的开环执行器量直接发送给仿真或真实飞行器。
+
+<a id="section-11"></a>
+
+# 11. SplineTrajectory 与 GCOPTER 的区别及选型
+
+<a id="section-11-1"></a>
+
+## 11.1 核心区别
+
+[SplineTrajectory](https://github.com/Bziyue/SplineTrajectory) 和 [GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) 不完全属于同一层级：
+
+> **SplineTrajectory 是通用的轨迹样条生成和优化数学库；GCOPTER 是基于 MINCO 构建的完整多旋翼轨迹规划框架。**
+
+SplineTrajectory 在数学上与 MINCO 等价，主要改进了样条求解器、梯度传播和优化接口；GCOPTER 则在 MINCO 之上提供路径搜索、安全走廊、碰撞约束以及多旋翼动力学等完整规划流程。
+
+可以把二者理解为：
+
+```text
+SplineTrajectory：轨迹优化“内核”
+GCOPTER：包含优化内核、环境建模和规划流程的完整系统
+```
+
+因此，两者不是简单的替代关系。SplineTrajectory 可以作为 GCOPTER 中 MINCO 模块的替代或重构后端。
+
+<a id="section-11-2"></a>
+
+## 11.2 功能对比
+
+| 对比项 | SplineTrajectory | GCOPTER |
+|---|---|---|
+| 项目定位 | 通用样条生成与优化库 | 完整多旋翼轨迹规划框架 |
+| 数学基础 | 与 MINCO 数学等价 | 直接使用 MINCO |
+| 样条类型 | S2、S3、S4 | 内含 MINCO S2、S3、S4 |
+| 维度 | 模板化任意维度 | 当前实现主要围绕三维位置 |
+| 线性求解 | 块三对角 Thomas 求解，复杂度为 $O(N)$ | MINCO 带状矩阵 LU 求解 |
+| 优化变量 | 时间、空间点、边界状态和辅助变量 | 时间和空间中间点 |
+| 梯度 | 时间、空间点和边界状态的完整梯度 | 主要传播时间和空间点梯度 |
+| 代价接口 | 通用积分、航点和全轨迹代价接口 | 已实现多旋翼状态、输入和碰撞代价 |
+| 地图与避障 | 库本体不提供 | 提供路径搜索、安全走廊、FIRI 和地图接口 |
+| 动力学模型 | 不绑定具体飞行器 | 内置多旋翼微分平坦映射 |
+| 工程依赖 | Header-only、Eigen、C++17 | ROS/catkin 及地图、规划和优化模块 |
+| 完整程度 | 更接近优化基础库 | 更接近可直接运行的规划系统 |
+
+需要注意，“SplineTrajectory 支持任意维度”描述的是其模板化工程接口；这并不表示 MINCO 数学理论本身只能用于三维，而是 GCOPTER 自带的 MINCO 实现主要围绕三维位置组织。
+
+<a id="section-11-3"></a>
+
+## 11.3 SplineTrajectory 相对 MINCO 实现的改进
+
+SplineTrajectory 不是一种取代 MINCO 的新轨迹理论，而是对 MINCO 工程实现的通用化重构。它支持：
+
+- 三次样条：最小加速度，对应 MINCO S2；
+- 五次样条：最小 Jerk，对应 MINCO S3；
+- 七次样条：最小 Snap，对应 MINCO S4；
+- 时间、空间中间点和边界状态的梯度；
+- 通用积分代价、航点代价和全轨迹代价接口；
+- 用 `AuxiliaryStateMap` 引入额外优化变量；
+- L-BFGS 优化器接口；
+- 分段批量求值和缓存。
+
+这些能力使其更容易脱离多旋翼假设，构造针对尾座式飞行器的优化问题。具体接口可参考：
+
+- [SplineTrajectory 官方说明](https://github.com/Bziyue/SplineTrajectory#readme)
+- [SplineOptimizer 接口说明](https://github.com/Bziyue/SplineTrajectory/blob/main/include/SplineOptimizerProtocols.md)
+
+<a id="section-11-4"></a>
+
+## 11.4 对当前尾座式项目的意义
+
+对于论文 2554 的轨迹优化，SplineTrajectory 更适合作为底层优化库，因为可以将尾座式执行器可行性写成通用积分代价：
+
+$$
+J_{\mathrm{act}}
+=
+\int_0^T
+\sum_i
+\rho_i\!\left(g_i(\mathbf u(t))\right)\,dt
+$$
+
+其中，通过论文 2554 的尾座式完整微分平坦映射计算：
+
+$$
+(\mathbf p,\dot{\mathbf p},\ddot{\mathbf p},
+\mathbf p^{(3)},\mathbf p^{(4)},
+\psi,\dot\psi,\ddot\psi)
+\longrightarrow
+(\mathbf q,T,\boldsymbol\Omega,\dot{\boldsymbol\Omega})
+\longrightarrow
+(T_1,T_2,\delta_1,\delta_2)
+$$
+
+随后分别约束：
+
+$$
+T_{i,\min}\leq T_i\leq T_{i,\max},
+\qquad
+\delta_{i,\min}\leq\delta_i\leq\delta_{i,\max}
+$$
+
+SplineTrajectory 的局部状态和积分代价接口适合实现这类自定义执行器代价。但是，它与原始 GCOPTER 一样，**不会自动提供尾座式动力学、完整平坦映射或双电机双舵面的执行器约束**，这些仍需根据论文 2554 实现。
+
+<a id="section-11-5"></a>
+
+## 11.5 位置与 yaw 的样条组织方式
+
+论文 2554 对位置和 yaw 使用不同的导数阶次：
+
+- 三维位置：最小 Snap，即 S4 七次样条；
+- 一维 yaw：最小加速度，即 S2 三次样条。
+
+因此，不建议把位置和 yaw 简单合并成一个统一的四维样条，因为这样会对四个分量使用相同的多项式阶次和控制代价。更合适的组织方式是：
+
+```text
+三维 S4 位置样条 ─┐
+                    ├─ 共享每一段时间 T_k
+一维 S2 yaw 样条 ──┘
+```
+
+两个样条共享分段时间，将各自的平滑代价、边界条件和执行器约束梯度汇总到同一个优化目标中，从而同时优化：
+
+$$
+\{\mathbf p_k,\psi_k,T_k\}
+$$
+
+也就是说，SplineTrajectory 和 GCOPTER 都可以实现位置与时间联合优化；区别主要在于 SplineTrajectory 提供了更通用的时间映射、空间映射和代价接口，而 GCOPTER 已经提供了围绕多旋翼规划组织好的整体流程。
+
+<a id="section-11-6"></a>
+
+## 11.6 两种推荐方案
+
+### 方案一：只需要复现论文 2554 的轨迹生成
+
+如果输入主要是航点和边界状态，暂时不需要复杂地图避障，可以直接使用 SplineTrajectory，并增加：
+
+1. 三维 S4 位置样条；
+2. 一维 S2 yaw 样条；
+3. 位置与 yaw 的共享时间参数化；
+4. 尾座式完整微分平坦映射；
+5. 双电机和双舵面的可行性代价；
+6. 优化后的高密度独立可行性验证。
+
+这种方案结构更轻，适合先验证论文 2554 的数学模型和执行器约束。
+
+### 方案二：需要完整地图避障规划
+
+如果还需要地图、A* 路径搜索、凸安全走廊和障碍物约束，应保留 GCOPTER 的上层规划结构，并用 SplineTrajectory 替换或重构其 MINCO 优化后端：
+
+```text
+地图与路径搜索
+        ↓
+GCOPTER/FIRI 安全走廊
+        ↓
+SplineTrajectory 时空联合优化
+        ↓
+尾座式微分平坦映射
+        ↓
+双电机、双舵面约束代价
+        ↓
+论文 2566 的 PD + INDI 闭环控制器
+```
+
+这种组合能够同时利用 GCOPTER 的环境规划能力和 SplineTrajectory 的通用优化接口。
+
+<a id="section-11-7"></a>
+
+## 11.7 与硬约束的关系
+
+SplineTrajectory 提供的是通用代价和梯度接口，本身不是带显式不等式硬约束的非线性规划器。因此，把执行器限制写入其积分代价时，通常仍属于罚函数处理：
+
+$$
+\min J_{\mathrm{smooth}}+J_{\mathrm{time}}
++\lambda J_{\mathrm{act}}
+$$
+
+这与 GCOPTER 官方实现中在离散积分节点加入平滑罚函数的思路相近，不能仅凭罚函数形式保证连续时间内绝对不越界。
+
+如果必须将执行器限制作为严格的不等式约束，应在保留样条参数化和梯度传播的同时，使用增广拉格朗日、SQP 或 IPOPT 等外层约束优化方法。无论采用哪种方法，优化完成后仍应使用更高时间分辨率检查 $T_1,T_2,\delta_1,\delta_2$，并在峰值附近自适应增加约束节点。
+
+<a id="section-11-8"></a>
+
+## 11.8 最终建议
+
+对于当前项目，推荐采用以下分工：
+
+$$
+\boxed{
+\text{GCOPTER 提供地图、路径搜索和安全走廊}
+}
+$$
+
+$$
+\boxed{
+\text{SplineTrajectory 提供位置、yaw 和时间的联合优化内核}
+}
+$$
+
+$$
+\boxed{
+\text{论文 2554 提供尾座式平坦映射和执行器可行性模型}
+}
+$$
+
+$$
+\boxed{
+\text{论文 2566 的 PD+INDI 控制器负责实际闭环轨迹跟踪}
+}
+$$
+
+因此，最合理的选择不是在 SplineTrajectory 和 GCOPTER 之间简单二选一：
+
+- 只做无障碍航点轨迹和论文算法验证时，优先使用 SplineTrajectory；
+- 需要完整避障规划时，以 GCOPTER 为上层框架；
+- 在完整系统中，可以使用 SplineTrajectory 重构 GCOPTER 的 MINCO 优化内核；
+- 无论选择哪种框架，尾座式平坦映射、执行器约束梯度和连续时间可行性验证都需要单独实现。
