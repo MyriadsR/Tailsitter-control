@@ -1,0 +1,7 @@
+# Values matching the current repository's config.py.
+mass: 0.7
+c_T: 1.8e-6
+c_mu: 2.2e-8
+omega_max: 2500.0
+delta_max: 1.0
+

@@ -1,0 +1,8 @@
+# Published paper values where available; remaining geometry/aerodynamic values are
+# explicitly retained as estimates until the original identification data is available.
+mass: 0.68
+c_T: 1.62e-6
+c_mu: 1.78e-8
+omega_max: 2500.0
+delta_max: 1.0
+
