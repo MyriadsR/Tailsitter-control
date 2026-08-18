@@ -1,0 +1,3 @@
+[submodule "planning/third_party/SplineTrajectory"]
+	path = planning/third_party/SplineTrajectory
+	url = https://github.com/Bziyue/SplineTrajectory.git
