@@ -9,7 +9,7 @@
 - [7. 双电机总推力与差分推力的可行分配](#section-7)
 - [8. Knife-Edge Transition 跟踪变差的原因与调参验证](#section-8)
 - [9. 飞行器三轴控制效率比较](#section-9)
-- [10. 使用 GCOPTER 实现 2554 论文的尾座式轨迹规划](#section-10)
+- [10. 使用 GCOPTER 实现 paper_planning 的尾座式轨迹规划](#section-10)
   - [10.1 总体结论](#section-10-1)
   - [10.2 可以直接复用的部分](#section-10-2)
   - [10.3 必须替换的部分](#section-10-3)
@@ -27,6 +27,24 @@
   - [11.6 两种推荐方案](#section-11-6)
   - [11.7 与硬约束的关系](#section-11-7)
   - [11.8 最终建议](#section-11-8)
+- [12. 在 planning 中使用 SplineTrajectory 复现 paper_planning](#section-12)
+  - [12.1 总体实现路线](#section-12-1)
+  - [12.2 建议的目录结构](#section-12-2)
+  - [12.3 位置与 yaw 的组合样条](#section-12-3)
+  - [12.4 固定总时间下优化时间分配](#section-12-4)
+  - [12.5 paper_planning 前向平坦变换](#section-12-5)
+  - [12.6 执行器可行性检查与最短时间搜索](#section-12-6)
+  - [12.7 第一条回归轨迹](#section-12-7)
+  - [12.8 接入当前 Python 仿真](#section-12-8)
+  - [12.9 当前限制与开发顺序](#section-12-9)
+- [13. 联合优化位置、时间与执行器约束](#section-13)
+  - [13.1 总体判断](#section-13-1)
+  - [13.2 paper_planning 与多保真时间优化的关系](#section-13-2)
+  - [13.3 GCOPTER 类约束能提供什么](#section-13-3)
+  - [13.4 推荐的联合优化形式](#section-13-4)
+  - [13.5 “硬约束”与采样约束的区别](#section-13-5)
+  - [13.6 工程实现路线](#section-13-6)
+  - [13.7 最终建议](#section-13-7)
 
 <a id="section-1"></a>
 
@@ -3510,13 +3528,13 @@ $$
 
 <a id="section-10"></a>
 
-# 10. 使用 GCOPTER 实现 2554 论文的尾座式轨迹规划
+# 10. 使用 GCOPTER 实现 paper_planning 的尾座式轨迹规划
 
 <a id="section-10-1"></a>
 
 ## 10.1 总体结论
 
-[GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) 可以作为 2554 论文轨迹规划算法的优化框架。它适合复用的核心是 MINCO 稀疏多项式参数化、空间和时间变量映射、约束积分、梯度传播及 L-BFGS 优化器，而不是现成的多旋翼动力学和平坦映射。
+[GCOPTER](https://github.com/ZJU-FAST-Lab/GCOPTER) 可以作为 `paper_planning` 轨迹规划算法的优化框架。它适合复用的核心是 MINCO 稀疏多项式参数化、空间和时间变量映射、约束积分、梯度传播及 L-BFGS 优化器，而不是现成的多旋翼动力学和平坦映射。
 
 经过尾座式适配后，优化器可以联合优化：
 
@@ -3527,7 +3545,7 @@ $$
 - 单电机推力、单舵面偏角等执行器约束；
 - 速度、安全走廊和其他运动学、动力学约束。
 
-因此，它可以把 2554 原来的两层流程
+因此，它可以把 `paper_planning` 原来的两层流程
 
 ```text
 先生成 Minimum-Snap 轨迹
@@ -3545,7 +3563,7 @@ $$
 最小化平滑度代价、总时间和约束违反代价
 ```
 
-但是不能直接调用 GCOPTER 当前的 `GCOPTER_PolytopeSFC` 得到符合 2554 的结果。其官方示例是多旋翼模型，平坦输出和执行器都与尾座式飞翼不同，必须替换核心平坦映射和约束函数。
+但是不能直接调用 GCOPTER 当前的 `GCOPTER_PolytopeSFC` 得到符合 `paper_planning` 的结果。其官方示例是多旋翼模型，平坦输出和执行器都与尾座式飞翼不同，必须替换核心平坦映射和约束函数。
 
 <a id="section-10-2"></a>
 
@@ -3596,7 +3614,7 @@ $$
 
 ### 10.3.1 位置改用 S4 MINCO
 
-2554 对位置使用 Minimum-Snap 目标：
+`paper_planning` 对位置使用 Minimum-Snap 目标：
 
 $$
 J_x=\int_0^T\left\|\mathbf x^{(4)}(t)\right\|^2dt
@@ -3606,11 +3624,11 @@ $$
 
 - [MINCO_S4NU](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/minco.hpp#L3308-L3349)
 
-它与 2554 所需的轨迹连续性相符：位置至少需要四阶连续，才能使理想控制输入连续并可用于执行器可行性分析。
+它与 `paper_planning` 所需的轨迹连续性相符：位置至少需要四阶连续，才能使理想控制输入连续并可用于执行器可行性分析。
 
 ### 10.3.2 yaw 改用 S2 MINCO
 
-2554 对 yaw 使用 Minimum-Acceleration 目标：
+`paper_planning` 对 yaw 使用 Minimum-Acceleration 目标：
 
 $$
 J_\psi=\mu_\psi\int_0^T\ddot\psi^2(t)dt
@@ -3653,7 +3671,7 @@ $$
 
 - [多旋翼 flatness.hpp](https://github.com/ZJU-FAST-Lab/GCOPTER/blob/main/gcopter/include/gcopter/flatness.hpp#L827-L841)
 
-2554 的尾座式完整平坦映射必须接收更高阶导数：
+`paper_planning` 的尾座式完整平坦映射必须接收更高阶导数：
 
 $$
 \left(
@@ -3682,7 +3700,7 @@ public:
 };
 ```
 
-其中 `forward()` 实现 2554 的式 (21)～(56)，`backward()` 将执行器约束的梯度反向传播到：
+其中 `forward()` 实现 `paper_planning` 的式 (21)～(56)，`backward()` 将执行器约束的梯度反向传播到：
 
 $$
 \mathbf x,\mathbf v,\mathbf a,\mathbf j,\mathbf s,
@@ -3699,7 +3717,7 @@ GCOPTER 当前约束计算虽然已经算出 Snap，但只把 $\mathbf v,\mathbf
 
 ### 10.3.4 处理姿态分支和奇异点
 
-2554 的平坦变换包含 `atan2`、$k\pi$ 姿态分支和若干分母。梯度优化要求目标函数在局部尽可能光滑，因此需要：
+`paper_planning` 的平坦变换包含 `atan2`、$k\pi$ 姿态分支和若干分母。梯度优化要求目标函数在局部尽可能光滑，因此需要：
 
 - 对 yaw 使用连续展开值；
 - 在一次局部优化过程中保持姿态分支连续；
@@ -3845,7 +3863,7 @@ $$
 
 ## 10.7 推荐的软件结构
 
-建议把 GCOPTER 适配层与当前 2566 闭环控制器解耦：
+建议把 GCOPTER 适配层与当前 `paper_control` 闭环控制器解耦：
 
 ```text
 航点、导数约束和安全走廊
@@ -3857,7 +3875,7 @@ $$
                 ↓
 x,v,a,j,snap,ψ,ψ̇,ψ̈
                 ↓
-2554 尾座式完整平坦变换
+paper_planning 尾座式完整平坦变换
                 ↓
 原始 T1、T2、δ1、δ2
                 ↓
@@ -3868,7 +3886,7 @@ L-BFGS / 增广拉格朗日 / SQP
 优化后高密度可行性验证
                 ↓
 只把 x,v,a,j,ψ,ψ̇
-交给现有 2566 闭环控制器
+交给现有 paper_control 闭环控制器
 ```
 
 推荐新增模块如下：
@@ -3877,7 +3895,7 @@ L-BFGS / 增广拉格朗日 / SQP
 planner/
 ├── minco_position_s4.*       # 三维位置 Minimum-Snap
 ├── minco_yaw_s2.*            # 一维 yaw Minimum-Acceleration
-├── tailsitter_flatness.*     # 2554 式 (21)～(56)
+├── tailsitter_flatness.*     # paper_planning 式 (21)～(56)
 ├── actuator_constraints.*    # 原始单执行器约束及梯度
 ├── trajectory_optimizer.*    # 时空联合优化
 └── feasibility_validator.*   # 高密度独立验证
@@ -3889,7 +3907,7 @@ planner/
 x, v, a, jerk, snap, psi, psi_dot, psi_ddot
 ```
 
-但当前 2566 控制器仍然只需要：
+但当前 `paper_control` 控制器仍然只需要：
 
 ```text
 x, v, a, jerk, psi, psi_dot
@@ -3901,7 +3919,7 @@ Snap 和 $\ddot\psi$ 主要用于规划阶段的开环执行器预测与可行�
 
 ## 10.8 最终判断
 
-GCOPTER 很适合作为 2554 轨迹规划算法的新优化后端，并且能够联合优化轨迹位置和分段时间。其优势是：
+GCOPTER 很适合作为 `paper_planning` 轨迹规划算法的新优化后端，并且能够联合优化轨迹位置和分段时间。其优势是：
 
 - 通过 MINCO 消除大量多项式系数决策变量；
 - 能够直接优化中间位置和时间；
@@ -3927,13 +3945,13 @@ $$
 
 真正的主要开发工作是：
 
-1. 实现 2554 的尾座式完整平坦映射；
+1. 实现 `paper_planning` 的尾座式完整平坦映射；
 2. 实现该映射的稳定解析梯度或自动微分版本；
 3. 增加独立 yaw 轨迹并与位置共享时间；
 4. 将总推力约束改成双电机、双舵面的单执行器约束；
 5. 处理姿态分支、奇异点和连续时间可行性验证。
 
-完成这些适配后，优化所得轨迹仍应交给当前基于 2566 的 PD+INDI 控制器跟踪，而不是把 2554 预测的开环执行器量直接发送给仿真或真实飞行器。
+完成这些适配后，优化所得轨迹仍应交给当前基于 `paper_control` 的 PD+INDI 控制器跟踪，而不是把 `paper_planning` 预测的开环执行器量直接发送给仿真或真实飞行器。
 
 <a id="section-11"></a>
 
@@ -4003,7 +4021,7 @@ SplineTrajectory 不是一种取代 MINCO 的新轨迹理论，而是对 MINCO �
 
 ## 11.4 对当前尾座式项目的意义
 
-对于论文 2554 的轨迹优化，SplineTrajectory 更适合作为底层优化库，因为可以将尾座式执行器可行性写成通用积分代价：
+对于 `paper_planning` 的轨迹优化，SplineTrajectory 更适合作为底层优化库，因为可以将尾座式执行器可行性写成通用积分代价：
 
 $$
 J_{\mathrm{act}}
@@ -4013,7 +4031,7 @@ J_{\mathrm{act}}
 \rho_i\!\left(g_i(\mathbf u(t))\right)\,dt
 $$
 
-其中，通过论文 2554 的尾座式完整微分平坦映射计算：
+其中，通过 `paper_planning` 的尾座式完整微分平坦映射计算：
 
 $$
 (\mathbf p,\dot{\mathbf p},\ddot{\mathbf p},
@@ -4033,13 +4051,13 @@ T_{i,\min}\leq T_i\leq T_{i,\max},
 \delta_{i,\min}\leq\delta_i\leq\delta_{i,\max}
 $$
 
-SplineTrajectory 的局部状态和积分代价接口适合实现这类自定义执行器代价。但是，它与原始 GCOPTER 一样，**不会自动提供尾座式动力学、完整平坦映射或双电机双舵面的执行器约束**，这些仍需根据论文 2554 实现。
+SplineTrajectory 的局部状态和积分代价接口适合实现这类自定义执行器代价。但是，它与原始 GCOPTER 一样，**不会自动提供尾座式动力学、完整平坦映射或双电机双舵面的执行器约束**，这些仍需根据 `paper_planning` 实现。
 
 <a id="section-11-5"></a>
 
 ## 11.5 位置与 yaw 的样条组织方式
 
-论文 2554 对位置和 yaw 使用不同的导数阶次：
+`paper_planning` 对位置和 yaw 使用不同的导数阶次：
 
 - 三维位置：最小 Snap，即 S4 七次样条；
 - 一维 yaw：最小加速度，即 S2 三次样条。
@@ -4064,7 +4082,7 @@ $$
 
 ## 11.6 两种推荐方案
 
-### 方案一：只需要复现论文 2554 的轨迹生成
+### 方案一：只需要复现 paper_planning 的轨迹生成
 
 如果输入主要是航点和边界状态，暂时不需要复杂地图避障，可以直接使用 SplineTrajectory，并增加：
 
@@ -4075,7 +4093,7 @@ $$
 5. 双电机和双舵面的可行性代价；
 6. 优化后的高密度独立可行性验证。
 
-这种方案结构更轻，适合先验证论文 2554 的数学模型和执行器约束。
+这种方案结构更轻，适合先验证 `paper_planning` 的数学模型和执行器约束。
 
 ### 方案二：需要完整地图避障规划
 
@@ -4092,7 +4110,7 @@ SplineTrajectory 时空联合优化
         ↓
 双电机、双舵面约束代价
         ↓
-论文 2566 的 PD + INDI 闭环控制器
+paper_control 的 PD + INDI 闭环控制器
 ```
 
 这种组合能够同时利用 GCOPTER 的环境规划能力和 SplineTrajectory 的通用优化接口。
@@ -4132,13 +4150,13 @@ $$
 
 $$
 \boxed{
-\text{论文 2554 提供尾座式平坦映射和执行器可行性模型}
+\text{paper_planning 提供尾座式平坦映射和执行器可行性模型}
 }
 $$
 
 $$
 \boxed{
-\text{论文 2566 的 PD+INDI 控制器负责实际闭环轨迹跟踪}
+\text{paper_control 的 PD+INDI 控制器负责实际闭环轨迹跟踪}
 }
 $$
 
@@ -4148,3 +4166,833 @@ $$
 - 需要完整避障规划时，以 GCOPTER 为上层框架；
 - 在完整系统中，可以使用 SplineTrajectory 重构 GCOPTER 的 MINCO 优化内核；
 - 无论选择哪种框架，尾座式平坦映射、执行器约束梯度和连续时间可行性验证都需要单独实现。
+
+<a id="section-12"></a>
+
+# 12. 在 planning 中使用 SplineTrajectory 复现 paper_planning
+
+<a id="section-12-1"></a>
+
+## 12.1 总体实现路线
+
+可以在当前项目的 `planning/` 目录中实现。第一版建议严格复现 `paper_planning` 的“两层轨迹生成”：
+
+```text
+固定总时间下优化分段时间比例
+        ↓
+3D SepticSpline 最小 Snap
+1D CubicSpline 最小 yaw 加速度
+        ↓
+整体缩放轨迹时间
+        ↓
+完整平坦变换计算原始执行器输入
+        ↓
+检查 ω1、ω2、δ1、δ2 是否可行
+```
+
+第一版不应急于把执行器约束写入 `SplineOptimizer` 的罚函数。`paper_planning` 采用的是：
+
+1. 内层在固定总时间下最小化位置 Snap 和 yaw 加速度；
+2. 外层整体缩放时间；
+3. 对每个候选轨迹使用完整平坦变换前向计算执行器输入；
+4. 检查电机转速和舵面偏角是否位于允许范围内。
+
+因此，第一版不需要执行器约束关于样条变量的解析梯度。这可以显著降低实现和调试难度，同时与论文算法保持一致。
+
+本地环境已经验证：
+
+- SplineTrajectory 位于 `/home/zr/SplineTrajectory`；
+- 库能够正常编译；
+- `test_spline_optimizer` 已通过；
+- 当前系统已有 NLopt 2.7.1，可用于外层时间分配优化；
+- 当前项目的 `planning/` 目录为空，可以按本章结构直接组织。
+
+<a id="section-12-2"></a>
+
+## 12.2 建议的目录结构
+
+```text
+planning/
+├── CMakeLists.txt
+├── README.md
+├── config/
+│   ├── paper_vehicle.yaml
+│   └── simulation_vehicle.yaml
+├── include/planning/
+│   ├── planning_types.hpp
+│   ├── flat_output_trajectory.hpp
+│   ├── time_allocation.hpp
+│   ├── tailsitter_flatness.hpp
+│   ├── feasibility_checker.hpp
+│   ├── time_scaler.hpp
+│   └── trajectory_exporter.hpp
+├── src/
+│   ├── flat_output_trajectory.cpp
+│   ├── time_allocation.cpp
+│   ├── tailsitter_flatness.cpp
+│   ├── feasibility_checker.cpp
+│   ├── time_scaler.cpp
+│   └── trajectory_exporter.cpp
+├── apps/
+│   └── generate_hover_to_hover.cpp
+└── tests/
+    ├── test_spline.cpp
+    ├── test_flatness.cpp
+    ├── test_feasibility.cpp
+    └── test_hover_to_hover.cpp
+```
+
+SplineTrajectory 应通过 CMake 可配置路径引用，不能在源代码中写死绝对路径：
+
+```cmake
+set(SPLINE_TRAJECTORY_ROOT
+    "/home/zr/SplineTrajectory"
+    CACHE PATH "SplineTrajectory source directory"
+)
+
+target_include_directories(tailsitter_planning PRIVATE
+    ${SPLINE_TRAJECTORY_ROOT}/include
+)
+```
+
+如果后续要让项目在其他计算机上稳定构建，可以再将 SplineTrajectory 改为 Git submodule 或安装为标准 CMake 包。
+
+<a id="section-12-3"></a>
+
+## 12.3 位置与 yaw 的组合样条
+
+不能把位置和 yaw 简单合并为一个四维同阶样条，因为两者的目标导数阶次不同：
+
+- 三维位置最小化四阶导数 Snap；
+- 一维 yaw 最小化二阶导数 yaw acceleration。
+
+应该分别使用：
+
+```cpp
+using PositionSpline = SplineTrajectory::SepticSplineND<3>;
+using YawSpline = SplineTrajectory::CubicSplineND<1>;
+```
+
+其中：
+
+- `SepticSplineND<3>` 是七次位置样条，对应 MINCO S4；
+- `CubicSplineND<1>` 是三次 yaw 样条，对应 MINCO S2；
+- 两套样条共享同一组物理分段时间 `durations`。
+
+建议定义统一的平坦输出采样结构：
+
+```cpp
+struct FlatOutputSample
+{
+    Eigen::Vector3d position;
+    Eigen::Vector3d velocity;
+    Eigen::Vector3d acceleration;
+    Eigen::Vector3d jerk;
+    Eigen::Vector3d snap;
+    Eigen::Vector3d crackle;
+
+    double yaw;
+    double yaw_rate;
+    double yaw_acceleration;
+    double yaw_jerk;
+};
+```
+
+组合轨迹类可以设计为：
+
+```cpp
+class FlatOutputTrajectory
+{
+public:
+    void update(const std::vector<double>& durations,
+                const PositionMatrix& position_waypoints,
+                const YawMatrix& yaw_waypoints,
+                const PositionBoundary& position_boundary,
+                const YawBoundary& yaw_boundary);
+
+    FlatOutputSample sample(double time) const;
+    double energy(double yaw_weight) const;
+    Eigen::VectorXd energyTimeGradient(double yaw_weight) const;
+
+private:
+    PositionSpline position_;
+    YawSpline yaw_;
+};
+```
+
+采样时分别获得位置和 yaw 的各阶导数：
+
+```cpp
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Pos);
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Vel);
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Acc);
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Jerk);
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Snap);
+position_trajectory.evaluate(t, SplineTrajectory::Deriv::Crackle);
+
+yaw_trajectory.evaluate(t, SplineTrajectory::Deriv::Pos);
+yaw_trajectory.evaluate(t, SplineTrajectory::Deriv::Vel);
+yaw_trajectory.evaluate(t, SplineTrajectory::Deriv::Acc);
+yaw_trajectory.evaluate(t, SplineTrajectory::Deriv::Jerk);
+```
+
+位置的 crackle 主要用于以后对含 Snap 的连续时间代价求时间梯度。按照论文第一版的前向可行性检查方法，它不是必需输入，但建议预留。
+
+### yaw 展开
+
+yaw 属于圆周变量，进入普通实数样条之前必须先展开。例如：
+
+```text
+[170°, -170°] → [170°, 190°]
+```
+
+否则样条会错误地选择约 $340^\circ$ 的反方向旋转。只在显示或输出接口处将 yaw 重新映射到 $[-\pi,\pi)$；内部计算必须保持展开角连续。
+
+<a id="section-12-4"></a>
+
+## 12.4 固定总时间下优化时间分配
+
+`paper_planning` 的第一层优化目标是：
+
+$$
+J=J_{\mathrm{snap}}+\mu_\psi J_{\mathrm{yaw}}
+$$
+
+并满足：
+
+$$
+\sum_{i=1}^{M}T_i=\bar T,\qquad T_i>0
+$$
+
+不建议分别建立两个独立的 `SplineOptimizer`，因为它们会分别管理时间决策变量，不便于强制位置和 yaw 使用完全相同的时间。第一版可以直接使用两种样条提供的解析能量和时间梯度：
+
+```cpp
+double cost =
+    position_spline.getEnergy()
+    + mu_yaw * yaw_spline.getEnergy();
+
+Eigen::VectorXd grad_T =
+    position_spline.getEnergyGradTimes()
+    + mu_yaw * yaw_spline.getEnergyGradTimes();
+```
+
+然后使用 NLopt 的 L-BFGS 优化无约束时间变量 $\tau$。
+
+### 保证总时间固定
+
+采用归一化指数映射：
+
+$$
+T_i=\bar T\frac{\exp(\tau_i)}{\sum_j\exp(\tau_j)}
+$$
+
+它自动保证：
+
+$$
+T_i>0,\qquad\sum_iT_i=\bar T
+$$
+
+softmax 对所有 $\tau_i$ 同时加一个常数不会改变结果，因此存在冗余自由度。实现时应固定最后一个变量 $\tau_M=0$，只优化前 $M-1$ 个变量。
+
+由链式法则可得：
+
+$$
+\frac{\partial J}{\partial\tau_i}
+=
+T_i\left(
+\frac{\partial J}{\partial T_i}
+-
+\frac{1}{\bar T}
+\sum_jT_j\frac{\partial J}{\partial T_j}
+\right)
+$$
+
+初始时间可以按相邻位置航点距离分配：
+
+$$
+T_i^{(0)}
+=
+\bar T
+\frac{\|\mathbf p_{i+1}-\mathbf p_i\|+\epsilon}
+{\sum_j(\|\mathbf p_{j+1}-\mathbf p_j\|+\epsilon)}
+$$
+
+单段 hover-to-hover 没有时间比例自由度，应直接跳过 NLopt。
+
+当前任务只需要对两种不同阶次的平滑能量求和并共享时间，直接使用 `getEnergy()` 和 `getEnergyGradTimes()` 比搭建两个 `SplineOptimizer` 再耦合更简单。以后需要优化自由航点、走廊或执行器罚函数时，再引入完整 `SplineOptimizer`。
+
+<a id="section-12-5"></a>
+
+## 12.5 paper_planning 前向平坦变换
+
+`tailsitter_flatness.cpp` 应依次实现 `paper_planning` 式 (20)～(56)：
+
+```text
+v、a、jerk、snap、yaw、yaw_rate、yaw_acceleration
+                            ↓
+参考力 fᶦ
+                            ↓
+phi、theta、总推力 T
+                            ↓
+Omega、Omega_dot
+                            ↓
+期望力矩 m
+                            ↓
+差分推力 Delta T
+                            ↓
+T1、T2、omega1、omega2
+                            ↓
+delta1、delta2
+```
+
+建议输出完整的开环预测信息：
+
+```cpp
+struct ActuatorPrediction
+{
+    Eigen::Quaterniond attitude;
+    Eigen::Vector3d angular_velocity;
+    Eigen::Vector3d angular_acceleration;
+    Eigen::Vector3d moment;
+
+    double collective_thrust;
+    double thrust_1;
+    double thrust_2;
+    double rotor_speed_1;
+    double rotor_speed_2;
+    double flap_1;
+    double flap_2;
+
+    bool valid;
+    std::string failure_reason;
+};
+```
+
+接口为：
+
+```cpp
+class TailsitterFlatness
+{
+public:
+    ActuatorPrediction forward(
+        const FlatOutputSample& sample,
+        const BranchState& previous_branch) const;
+};
+```
+
+### 不使用限幅后的在线控制分配结果
+
+当前 `controller/actuator_ctrl.py` 会截断总推力和差分推力，并对舵面进行有界分配。这适合 `paper_control` 的在线闭环控制，但不适合规划可行性判断。规划器必须保留未限幅的：
+
+$$
+T_1,\quad T_2,\quad\delta_1,\quad\delta_2
+$$
+
+否则饱和会隐藏原始轨迹的约束违反。
+
+### 规划和控制的平坦映射分开
+
+当前 `controller/att_ctrl.py` 是 `paper_control` 的闭环映射，姿态计算会考虑当前舵面总偏角。`paper_planning` 的显式开环平坦变换则忽略舵面直接力的非最小相位贡献。
+
+因此，应在 `planning/` 中实现独立的规划平坦变换。两者可以共享旋转矩阵、参数和基础数学函数，但不能混用模型假设。
+
+### 姿态分支连续性
+
+式 (21) 和式 (24) 都存在 $k\pi$ 分支。每个采样点应：
+
+1. 计算所有有效候选分支；
+2. 将候选姿态转为四元数或旋转矩阵；
+3. 选择与上一采样点姿态距离最小的候选；
+4. 记录所选分支供下一点使用。
+
+不能只使用 `atan2` 主值，否则大滚转、倒飞或过渡飞行中可能出现姿态跳变，进一步产生角速度、角加速度和舵面预测尖峰。
+
+### hover 附近的速度范数
+
+论文表达式包含：
+
+$$
+\frac{\mathbf v^\top\mathbf a}{\|\mathbf v\|}
+$$
+
+在静止 hover 端点会出现 $0/0$。建议使用：
+
+$$
+r=\sqrt{\mathbf v^\top\mathbf v+\varepsilon_v^2}
+$$
+
+$$
+\dot r=\frac{\mathbf v^\top\mathbf a}{r}
+$$
+
+$$
+\ddot r=
+\frac{\mathbf a^\top\mathbf a+\mathbf v^\top\mathbf j}{r}
+-
+\frac{(\mathbf v^\top\mathbf a)^2}{r^3}
+$$
+
+这样可以避免 NaN，并保持 hover 附近计算连续。
+
+<a id="section-12-6"></a>
+
+## 12.6 执行器可行性检查与最短时间搜索
+
+至少应检查：
+
+$$
+0\leq\omega_1,\omega_2\leq\omega_{\max}
+$$
+
+$$
+|\delta_1|,|\delta_2|\leq\delta_{\max}
+$$
+
+同时检查：
+
+- $T_1,T_2\geq0$；
+- 舵面分配矩阵行列式或最小奇异值是否过小；
+- 平坦变换中的关键分母是否接近零；
+- 所有输出是否为有限数；
+- 姿态分支是否连续。
+
+可以定义最大归一化违反量：
+
+$$
+g_{\max}
+=
+\max_t
+\left\{
+\frac{\omega_1}{\omega_{\max}}-1,\,
+\frac{\omega_2}{\omega_{\max}}-1,\,
+\frac{|\delta_1|}{\delta_{\max}}-1,\,
+\frac{|\delta_2|}{\delta_{\max}}-1
+\right\}
+$$
+
+只有满足 $g_{\max}\leq0$ 才判定轨迹在开环模型下可行。
+
+工程应用时可以将规划上限收紧到实际上限的 $85\%$～$95\%$，为闭环稳定和模型误差保留裕量。但复现论文边界时，应先使用论文原始限制，再单独报告带安全裕量的结果。
+
+### 连续时间采样
+
+- 每段初始至少使用 100～200 个采样点；
+- 显式包含所有分段连接点；
+- 在执行器峰值和接近限值处自适应加密；
+- 最终验证使用约 0.5～1 ms 的采样间隔。
+
+不能只检查粗积分节点，因为执行器峰值可能位于两个采样点之间。
+
+### 整体时间缩放
+
+得到固定总时间下的最佳时间比例 $\mathbf T^\star$ 后，定义：
+
+$$
+\mathbf T(c)=c\mathbf T^\star
+$$
+
+每次改变 $c$ 都必须使用 $c\mathbf T^\star$ 重新构造位置和 yaw 样条，重新采样所有导数，并再次执行完整平坦变换。不能只修改时间戳而保留原导数，因为：
+
+$$
+\frac{d^r\mathbf p}{dt^r}\propto c^{-r}
+$$
+
+### 搜索最小可行缩放系数
+
+不能简单假设轨迹时间越长就一定越可行。由于姿态分支和气动状态变化，部分机动可能存在非单调可行域。建议：
+
+1. 在预设范围内粗扫描多个 $c$；
+2. 识别所有可行和不可行切换区间；
+3. 在每个切换区间内分别二分细化；
+4. 从所有可行区间中选取最小的可行 $c$。
+
+这比从单个初值进行一次二分更接近论文的多初值搜索，也能处理由姿态分支变化形成的多个可行区间。
+
+<a id="section-12-7"></a>
+
+## 12.7 第一条回归轨迹
+
+第一条测试不应直接选择 loop、knife-edge 或 climbing turn，而应先复现 6 m hover-to-hover：
+
+```text
+p0 = [0, 0, -10]
+p1 = [6, 0, -10]
+
+v0 = v1 = 0
+a0 = a1 = 0
+j0 = j1 = 0
+```
+
+分别测试：
+
+```text
+Case A：yaw 0 → 0
+Case B：yaw 0 → π
+```
+
+该测试只有一个位置段和一个 yaw 段，不涉及中间航点导数约束，也不需要优化时间比例，可以集中验证样条采样、平坦变换和执行器可行性。
+
+验收条件包括：
+
+1. 位置和 yaw 端点值正确；
+2. 位置端点速度、加速度和 Jerk 满足设置值；
+3. Snap 能量解析梯度通过有限差分；
+4. 平坦变换在整个区间无 NaN 或 Inf；
+5. 参考力和力矩能由预测执行器输入重新构造；
+6. 完整动力学力和力矩残差足够小；
+7. yaw 旋转轨迹的最短可行时间大于或接近无 yaw 轨迹；
+8. 缩短到可行边界以下后，至少一个电机或舵面越界。
+
+### 参数一致性
+
+当前 `config.py` 与论文参数不完全相同。例如当前仿真使用：
+
+- 质量约 $0.7\,\mathrm{kg}$；
+- $c_T=1.8\times10^{-6}$；
+- $c_\mu=2.2\times10^{-8}$。
+
+而 `paper_planning` 表格对应值约为：
+
+- 质量 $0.68\,\mathrm{kg}$；
+- $c_T=1.62\times10^{-6}$；
+- $c_\mu=1.78\times10^{-8}$。
+
+应保留两套明确命名的参数：
+
+```text
+paper_vehicle       # 用于论文结果复现
+simulation_vehicle  # 用于当前闭环仿真
+```
+
+不能混用两套参数后再声称数值复现了论文边界。论文没有完整公布的参数也应标明估算来源和不确定性。
+
+<a id="section-12-8"></a>
+
+## 12.8 接入当前 Python 仿真
+
+C++ 规划器可以导出：
+
+```text
+t,
+px,py,pz,
+vx,vy,vz,
+ax,ay,az,
+jx,jy,jz,
+snap_x,snap_y,snap_z,
+yaw,yaw_rate,yaw_acceleration,
+omega1_pred,omega2_pred,
+delta1_pred,delta2_pred
+```
+
+然后增加：
+
+```text
+trajectory/planned_trajectory.py
+```
+
+其接口继续满足当前仿真约定：
+
+```python
+def sample(t):
+    return (
+        position,
+        velocity,
+        acceleration,
+        jerk,
+        yaw,
+        yaw_rate,
+    )
+```
+
+`main_sim.py` 可以增加：
+
+```text
+--trajectory planned
+--trajectory-file planning/output/hover_to_hover.csv
+```
+
+预测的 `omega1_pred`、`omega2_pred`、`delta1_pred`、`delta2_pred` 只用于规划可行性报告和结果对比，不能直接发送给仿真。实际执行输入仍由 `paper_control` 的 PD+INDI 闭环控制器根据参考轨迹和当前状态计算。
+
+第一版使用高频 CSV 即可完成闭环验证。以后如果需要任意时间精确采样，可以导出每段多项式系数在 Python 中直接求值，或者使用 pybind11 封装 C++ 组合样条。
+
+<a id="section-12-9"></a>
+
+## 12.9 当前限制与开发顺序
+
+### 中间航点导数约束
+
+当前 SplineTrajectory 的 `BoundaryConditions` 只直接支持整条轨迹起点和终点的导数条件，但 `paper_planning` 的 loop、climbing turn、Immelmann 等机动还会在中间航点约束速度方向或大小。
+
+因此应分两步：
+
+1. 第一版完成 hover-to-hover 和只有位置、yaw 航点的轨迹；
+2. 第二版增加中间航点速度、加速度或 yaw rate 约束。
+
+如果中间导数必须严格满足等式约束，需要扩展 SplineTrajectory 的样条线性系统，或者在 `planning/` 中实现带导数掩码的稀疏等式约束多项式求解器。高权重罚函数只能近似满足，不能称为严格复现。
+
+### 推荐开发里程碑
+
+```text
+里程碑 1：组合样条
+  ├── 3D SepticSpline 位置
+  ├── 1D CubicSpline yaw
+  ├── 共享分段时间
+  └── 导数和能量梯度单元测试
+
+里程碑 2：固定总时间的时间分配
+  ├── softmax 时间映射
+  ├── NLopt L-BFGS
+  └── 解析梯度有限差分验证
+
+里程碑 3：paper_planning 前向平坦变换
+  ├── 姿态与总推力
+  ├── 角速度与角加速度
+  ├── 力矩
+  └── 原始电机、舵面输入
+
+里程碑 4：可行性和时间缩放
+  ├── 稠密、自适应采样
+  ├── 多区间缩放系数搜索
+  └── hover-to-hover 回归测试
+
+里程碑 5：接入 paper_control 仿真
+  ├── 导出轨迹
+  ├── Python 轨迹适配器
+  └── 闭环跟踪与开环预测对比
+
+里程碑 6：中间导数约束
+  └── 复现 loop、knife-edge 等复杂机动
+```
+
+最终推荐的开发顺序是：
+
+$$
+\boxed{
+\text{组合样条}
+\rightarrow
+\text{时间分配}
+\rightarrow
+\text{前向平坦变换}
+\rightarrow
+\text{执行器检查}
+\rightarrow
+\text{时间缩放}
+\rightarrow
+\text{闭环仿真接入}
+\rightarrow
+\text{中间导数约束}
+}
+$$
+
+按照这个顺序，最先完成的 hover-to-hover 版本就已经具备：
+
+- minimum-snap/minimum-yaw-acceleration 轨迹；
+- 位置与 yaw 的共享时间；
+- 原始执行器输入预测；
+- 最短可行时间搜索；
+- 向 `paper_control` 提供闭环参考轨迹的完整链路。
+
+<a id="section-13"></a>
+
+# 13. 联合优化位置、时间与执行器约束
+
+<a id="section-13-1"></a>
+
+## 13.1 总体判断
+
+可以把 `paper_planning` 的轨迹生成升级成类似 GCOPTER 的联合优化问题，让优化器同时调整中间位置点、yaw、分段时间，并通过尾座式平坦映射约束电机和舵面不超过上限。
+
+但这不是直接把现有 GCOPTER 或 SplineTrajectory 调一下参数就能完成。原因是尾座式执行器约束不是普通的速度、加速度或走廊约束，而是经过：
+
+```text
+位置/yaw 及其高阶导数
+        ↓
+paper_planning 尾座式平坦映射
+        ↓
+总推力、力矩、差分推力、舵面分配
+        ↓
+omega1、omega2、delta1、delta2
+```
+
+这一整条链路得到的耦合非线性约束。因此，优化器只能复用 MINCO、时间映射、梯度传播和非线性优化框架，不能复用多旋翼动力学约束本身。
+
+<a id="section-13-2"></a>
+
+## 13.2 paper_planning 与多保真时间优化的关系
+
+`paper_planning` 中提到的时间重分配来自 `Multi-fidelity black-box optimization for time-optimal quadrotor maneuvers` 的思想。该方法的核心不是把所有动力学约束解析写进一个大 NLP，而是把轨迹参数送入不同保真度的评估器：
+
+```text
+低保真解析模型
+        ↓
+仿真模型
+        ↓
+真实实验或高保真验证
+```
+
+然后用黑盒优化寻找更短且可行的时间分配。
+
+在 `paper_planning` 的上下文里，黑盒变量主要可以理解为：
+
+- 分段时间；
+- 部分几何参数；
+- 机动相关的少量形状参数。
+
+它适合做“时间最优的外层搜索”，特别适合处理模型误差、闭环跟踪失败、真实实验边界等难以解析求梯度的现象。
+
+它不等价于 GCOPTER 这种梯度型轨迹优化器。GCOPTER 更适合在解析模型内快速优化连续轨迹；多保真黑盒优化更适合在最终阶段对时间分配和可行性边界做保守修正。
+
+<a id="section-13-3"></a>
+
+## 13.3 GCOPTER 类约束能提供什么
+
+GCOPTER 类方法可以提供三件对当前项目有价值的能力：
+
+1. 用 MINCO 或 SplineTrajectory 低维参数化轨迹，避免直接优化所有多项式系数；
+2. 同时优化自由中间点和分段时间；
+3. 将速度、推力、角速度、执行器等约束写成采样积分罚函数或非线性约束。
+
+对当前尾座式项目，关键改造点是把 GCOPTER 的多旋翼 flatness 和 thrust/body-rate 约束替换为 `paper_planning` 的尾座式 flatness 和执行器约束：
+
+$$
+0 \leq T_1(t),T_2(t) \leq c_T\omega_{\max}^2
+$$
+
+$$
+|\delta_1(t)|,|\delta_2(t)| \leq \delta_{\max}
+$$
+
+实际实现时，建议直接约束单电机推力 $T_1,T_2$，而不是先约束 $\omega_1,\omega_2$。因为：
+
+$$
+\omega_i=\sqrt{T_i/c_T}
+$$
+
+在 $T_i$ 接近零时导数会变差；推力约束本身更平滑，也更接近分配方程。
+
+<a id="section-13-4"></a>
+
+## 13.4 推荐的联合优化形式
+
+可以将优化变量设为：
+
+```text
+自由中间位置点 q_i
+自由 yaw 航点 psi_i
+分段时间 T_i
+中间速度大小 s_i
+```
+
+其中关键机动点不能全部自由移动。对于 loop、climbing turn、Immelmann 这类机动，几何约束本身定义了动作。如果所有中间点都完全自由，优化器可能通过缩小、偏移或扭曲轨迹来逃避执行器约束，结果不再是原机动。
+
+推荐目标函数：
+
+$$
+\min
+\rho_T\sum_iT_i
++\rho_s J_{\mathrm{snap}}
++\rho_\psi J_{\mathrm{yaw}}
++\rho_g J_{\mathrm{geometry}}
+$$
+
+约束包括：
+
+- 起点、终点和关键机动航点固定；
+- 中间速度方向满足 $v(t_k)=s_k d_k$；
+- 必要时约束中间速度大小 $s_k$ 的范围；
+- yaw 或 yaw rate 满足机动定义；
+- $T_i \geq T_{\min}$；
+- $T_1,T_2,\delta_1,\delta_2$ 满足执行器限制；
+- 平坦映射中的奇异分母保持裕量；
+- 姿态分支连续。
+
+这里的“优化位置点”应理解为优化辅助支撑点或非关键航点，而不是把机动定义点全部放开。
+
+<a id="section-13-5"></a>
+
+## 13.5 “硬约束”与采样约束的区别
+
+如果使用 GCOPTER 原始风格的 L-BFGS 加罚函数，那么执行器限制通常是软约束：
+
+$$
+J_{\mathrm{act}}
+=
+\int \max(0,g_{\mathrm{act}}(t))^p dt
+$$
+
+这种形式优化速度快，但不能严格保证最终轨迹没有越界。罚权不够会越界；罚权过大又可能导致优化病态。
+
+如果使用 SLSQP、IPOPT、AUGLAG 等约束优化器，可以把采样点上的执行器限制写成显式不等式：
+
+$$
+g_{\mathrm{act}}(t_j)\leq0
+$$
+
+这比罚函数更接近硬约束，但仍然只是采样点硬约束。连续时间两采样点之间仍可能出现峰值，因此最终仍必须做高密度或自适应采样验证。
+
+严格意义上的连续时间硬约束需要对执行器表达式的整段最大值做可证明界定。由于尾座式平坦映射包含三角函数、归一化、姿态分支和舵面分配，这在工程实现中成本很高。当前项目更现实的做法是：
+
+```text
+优化阶段：采样约束或积分罚函数
+验证阶段：更高密度采样 + 峰值附近自适应加密
+实验阶段：闭环仿真和安全裕量
+```
+
+<a id="section-13-6"></a>
+
+## 13.6 工程实现路线
+
+建议不要一开始就跳到完整联合优化。更稳的实现路线是：
+
+```text
+阶段 A：复现 paper_planning
+  固定几何航点
+  固定总时间下优化时间比例
+  外层时间缩放
+  执行器前向可行性检查
+
+阶段 B：加入执行器罚函数
+  仍固定关键航点
+  对 T1、T2、delta1、delta2 加采样积分罚函数
+  优化分段时间和少量辅助航点
+
+阶段 C：改为显式约束优化
+  使用 SLSQP/IPOPT/AUGLAG
+  对采样点写入执行器不等式
+  保留最终高密度验证
+
+阶段 D：加入多保真外层
+  解析模型先给出候选轨迹
+  paper_control 闭环仿真评估跟踪误差和饱和
+  黑盒优化修正时间分配或几何参数
+```
+
+第一版可以基于 SplineTrajectory 完成阶段 A，因为它已经支持 3D S4 与 1D S2 样条以及时间梯度。阶段 B 以后需要自定义组合优化器，把位置样条、yaw 样条、共享时间变量和尾座式执行器约束放到同一个目标函数中。
+
+GCOPTER 可以作为阶段 B/C 的参考框架，但当前项目不应直接依赖 GCOPTER 的多旋翼约束代码。真正需要复用的是 MINCO 思路和时间/空间变量优化结构。
+
+<a id="section-13-7"></a>
+
+## 13.7 最终建议
+
+可行的最终架构是：
+
+```text
+SplineTrajectory 或 MINCO
+        ↓
+自由点 + 共享时间优化
+        ↓
+paper_planning 平坦映射
+        ↓
+执行器约束/罚函数
+        ↓
+高密度可行性验证
+        ↓
+paper_control 闭环仿真评估
+        ↓
+必要时多保真黑盒时间修正
+```
+
+也就是说，可以吸收 GCOPTER 类方法，把执行器约束提前放进优化器，让轨迹在生成阶段就倾向于可行；但不要完全取消 `paper_planning` 的前向可行性检查和时间缩放，也不要取消 `paper_control` 闭环仿真验证。
+
+当前项目最合理的顺序是先完成 `paper_planning` 的复现版本，再在其基础上加入执行器约束联合优化。这样每一步都有可对照的基线，否则一开始就同时改样条、flatness、执行器约束、时间优化和闭环验证，调试时很难判断误差来自哪一层。
