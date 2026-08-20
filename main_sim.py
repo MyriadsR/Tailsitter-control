@@ -3,6 +3,7 @@ Author: ZR
 Description: Tailsitter 飞翼无人机全系统闭环仿真主程序
 '''
 import argparse
+from pathlib import Path
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -25,6 +26,7 @@ from trajectory.test import (
     LemniscateTrajectory,
     TrajectoryGenerator,
 )
+from trajectory.planning_csv import PlanningCsvTrajectory
 
 # 导入数学工具
 from utils.math_help import zxy_euler_to_quaternion
@@ -66,6 +68,8 @@ def main(
     lap_time=None,
     log_path="flight_log.npz",
     show_plot=True,
+    trajectory_csv=None,
+    hold_duration=1.0,
 ):
     print("初始化仿真环境...")
     cfg = TailsitterConfig()
@@ -125,6 +129,18 @@ def main(
         )
     elif trajectory_name == "segments":
         trajectory = TrajectoryGenerator()
+    elif trajectory_name in {"planning-yaw0", "planning-yaw-pi", "planning-csv"}:
+        default_csv = {
+            "planning-yaw0": "planning/output/joint_hover_yaw0_optimized.csv",
+            "planning-yaw-pi": "planning/output/joint_hover_yaw_pi_optimized.csv",
+        }
+        if trajectory_csv is None:
+            if trajectory_name == "planning-csv":
+                raise ValueError("planning-csv 需要通过 --trajectory-csv 指定 CSV")
+            trajectory_csv = default_csv[trajectory_name]
+        trajectory = PlanningCsvTrajectory(
+            trajectory_csv, hold_duration=hold_duration
+        )
     else:
         raise ValueError(f"未知轨迹类型: {trajectory_name}")
     
@@ -326,6 +342,7 @@ def main(
     log_angular_acceleration, log_angular_acceleration_lpf = [], []
     log_angular_acceleration_command = []
     log_rotors, log_flaps = [], []
+    log_rotor_commands, log_flap_commands = [], []
     log_x_ref, log_v_ref, log_a_ref, log_psi_ref = [], [], [], []
     
     print(f"开始仿真运行，轨迹: {trajectory_name}...")
@@ -478,6 +495,8 @@ def main(
         log_angular_acceleration_command.append(omega_dot_c.copy())
         log_rotors.append(omega_rotors.copy())
         log_flaps.append(np.rad2deg(delta_flaps))
+        log_rotor_commands.append(omega_cmd.copy())
+        log_flap_commands.append(np.rad2deg(delta_cmd))
 
     print("仿真结束，正在绘图...")
     
@@ -499,9 +518,16 @@ def main(
     log_angular_acceleration_command = np.array(log_angular_acceleration_command)
     log_rotors = np.array(log_rotors)
     log_flaps = np.array(log_flaps)
+    log_rotor_commands = np.array(log_rotor_commands)
+    log_flap_commands = np.array(log_flap_commands)
 
     # 保存独立动画程序所需的时序日志。欧拉角顺序固定为 [psi, phi, theta]，
     # 单位为度；位置采用仿真使用的世界 NED 坐标系。
+    log_path = Path(log_path)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    planned_duration = float(
+        getattr(trajectory, "planned_duration", trajectory.total_duration)
+    )
     np.savez_compressed(
         log_path,
         time=log_t,
@@ -521,6 +547,12 @@ def main(
         angular_acceleration_command=log_angular_acceleration_command,
         rotor_speed=log_rotors,
         flap_deg=log_flaps,
+        rotor_speed_command=log_rotor_commands,
+        flap_command_deg=log_flap_commands,
+        planned_duration=np.array(planned_duration),
+        trajectory_source=np.array(
+            str(getattr(trajectory, "csv_path", trajectory_name))
+        ),
         coordinate_frame=np.array("NED"),
         euler_sequence=np.array("ZXY"),
     )
@@ -529,6 +561,17 @@ def main(
     # 位置跟踪误差统计 (RMS / 最大)
     pos_err_norm = np.linalg.norm(log_x_ref - log_pos, axis=1)
     print(f"位置跟踪误差:  RMS = {np.sqrt(np.mean(pos_err_norm**2)):.3f} m,  最大 = {pos_err_norm.max():.3f} m")
+
+    maneuver_mask = log_t <= planned_duration + 1e-12
+    maneuver_pos_error = pos_err_norm[maneuver_mask]
+    terminal_position_error = float(pos_err_norm[-1])
+    if planned_duration < trajectory.total_duration:
+        print(
+            "规划段位置误差:  "
+            f"RMS = {np.sqrt(np.mean(maneuver_pos_error**2)):.3f} m,  "
+            f"最大 = {maneuver_pos_error.max():.3f} m;  "
+            f"末端悬停误差 = {terminal_position_error:.3f} m"
+        )
 
     speed_actual = np.linalg.norm(log_vel, axis=1)
     speed_reference = np.linalg.norm(log_v_ref, axis=1)
@@ -581,6 +624,11 @@ def main(
         "trajectory": trajectory_name,
         "rms_position_error": float(np.sqrt(np.mean(pos_err_norm**2))),
         "max_position_error": float(pos_err_norm.max()),
+        "maneuver_rms_position_error": float(
+            np.sqrt(np.mean(maneuver_pos_error**2))
+        ),
+        "maneuver_max_position_error": float(maneuver_pos_error.max()),
+        "terminal_position_error": terminal_position_error,
         "rms_yaw_error_deg": float(
             np.rad2deg(np.sqrt(np.mean(yaw_error**2)))
         ),
@@ -600,6 +648,7 @@ def main(
             and np.all(np.isfinite(log_euler))
         ),
         "duration": float(t_end),
+        "planned_duration": planned_duration,
     }
 
 if __name__ == "__main__":
@@ -616,6 +665,9 @@ if __name__ == "__main__":
             "transition-to-forward",
             "transition-to-hover",
             "differential-turn",
+            "planning-yaw0",
+            "planning-yaw-pi",
+            "planning-csv",
         ),
         default="segments",
         help="选择分段轨迹或论文中的试验轨迹",
@@ -628,13 +680,25 @@ if __name__ == "__main__":
         "--lap-time", type=float, help="覆盖双纽线或椭圆跑道的单圈时间 (s)"
     )
     parser.add_argument("--log", default="flight_log.npz", help="NPZ 日志输出路径")
+    parser.add_argument(
+        "--trajectory-csv",
+        help="planning-csv 使用的 CSV；也可覆盖两种内置规划轨迹路径",
+    )
+    parser.add_argument(
+        "--hold-duration",
+        type=float,
+        default=1.0,
+        help="规划轨迹结束后的末端悬停时间，默认 1 s",
+    )
     parser.add_argument("--no-show", action="store_true", help="仿真后不打开绘图窗口")
     args = parser.parse_args()
     main(
-        args.trajectory,
-        args.laps,
-        args.speed,
-        args.lap_time,
-        args.log,
-        not args.no_show,
+        trajectory_name=args.trajectory,
+        laps=args.laps,
+        speed=args.speed,
+        lap_time=args.lap_time,
+        log_path=args.log,
+        show_plot=not args.no_show,
+        trajectory_csv=args.trajectory_csv,
+        hold_duration=args.hold_duration,
     )
