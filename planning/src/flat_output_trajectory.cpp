@@ -55,6 +55,34 @@ Eigen::VectorXd FlatOutputTrajectory::energyTimeGradient(double yaw_weight) cons
     return position_.getEnergyGradTimes() + yaw_weight * yaw_.getEnergyGradTimes();
 }
 
+FlatOutputTrajectory::CostGradient FlatOutputTrajectory::energyGradient(
+    double yaw_weight) const
+{
+    const auto position_gradient = position_.getEnergyGrad();
+    const auto yaw_gradient = yaw_.getEnergyGrad();
+    CostGradient result;
+    result.position_inner_points = position_gradient.inner_points;
+    result.yaw_inner_points = yaw_weight * yaw_gradient.inner_points;
+    result.times = position_gradient.times + yaw_weight * yaw_gradient.times;
+    return result;
+}
+
+FlatOutputTrajectory::CostGradient FlatOutputTrajectory::propagateCostGradient(
+    const PositionMatrix& partial_position_coefficients,
+    const Eigen::VectorXd& partial_position_times,
+    const YawMatrix& partial_yaw_coefficients,
+    const Eigen::VectorXd& partial_yaw_times)
+{
+    const auto position_gradient =
+        position_.propagateGrad(partial_position_coefficients, partial_position_times);
+    const auto yaw_gradient = yaw_.propagateGrad(partial_yaw_coefficients, partial_yaw_times);
+    CostGradient result;
+    result.position_inner_points = position_gradient.inner_points;
+    result.yaw_inner_points = yaw_gradient.inner_points;
+    result.times = position_gradient.times + yaw_gradient.times;
+    return result;
+}
+
 double FlatOutputTrajectory::duration() const { return position_.getDuration(); }
 const std::vector<double>& FlatOutputTrajectory::durations() const { return position_.getTimeSegments(); }
 const FlatOutputTrajectory::PositionMatrix& FlatOutputTrajectory::positionWaypoints() const { return position_.getSpacePoints(); }

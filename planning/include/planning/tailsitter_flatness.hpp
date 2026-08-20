@@ -13,6 +13,10 @@ public:
     ActuatorPrediction forward(const FlatOutputSample& sample,
                                const BranchState& previous_branch = BranchState{}) const;
 
+    ActuatorLinearization linearize(
+        const FlatOutputSample& sample,
+        const BranchState& previous_branch = BranchState{}) const;
+
     const VehicleParameters& parameters() const { return parameters_; }
 
 private:
@@ -20,4 +24,3 @@ private:
 };
 
 }  // namespace planning
-

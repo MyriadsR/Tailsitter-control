@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import os
 from pathlib import Path
+import sys
 import tempfile
 
 # The plotting command is often run in a restricted/headless environment. Keep
@@ -13,6 +14,8 @@ import tempfile
 _PLOT_CACHE = Path(tempfile.gettempdir()) / "tailsitter_planning_plot_cache"
 os.environ.setdefault("MPLCONFIGDIR", str(_PLOT_CACHE / "matplotlib"))
 os.environ.setdefault("XDG_CACHE_HOME", str(_PLOT_CACHE / "xdg"))
+if "--show" not in sys.argv:
+    os.environ.setdefault("MPLBACKEND", "Agg")
 
 import matplotlib.pyplot as plt
 from matplotlib import colors
@@ -38,6 +41,27 @@ REQUIRED_COLUMNS = (
     "delta1_pred",
     "delta2_pred",
 )
+
+ACTUATOR_COLUMNS = (
+    "omega1_pred",
+    "omega2_pred",
+    "delta1_pred",
+    "delta2_pred",
+)
+
+DYNAMIC_COLUMNS = (
+    "body_rate_norm",
+    "rotor_rate_1",
+    "rotor_rate_2",
+    "flap_rate_1",
+    "flap_rate_2",
+    "omega_cmd_req_1",
+    "omega_cmd_req_2",
+    "delta_cmd_req_1",
+    "delta_cmd_req_2",
+)
+
+HIGH_LEVEL_COLUMNS = ("collective_thrust",)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -82,6 +106,24 @@ def _parse_args() -> argparse.Namespace:
         "--delta-max", type=float, default=1.0, help="舵面绝对偏角上限 [rad]"
     )
     parser.add_argument(
+        "--body-rate-max",
+        type=float,
+        default=650.0 * np.pi / 180.0,
+        help="机体角速度范数上限 [rad/s]",
+    )
+    parser.add_argument(
+        "--servo-rate-max", type=float, default=25.0, help="舵面角速度上限 [rad/s]"
+    )
+    parser.add_argument(
+        "--velocity-max", type=float, default=8.0, help="速度范数上限 [m/s]"
+    )
+    parser.add_argument(
+        "--collective-thrust-max",
+        type=float,
+        default=20.25,
+        help="总推力上限 [N]",
+    )
+    parser.add_argument(
         "--cmap", default="viridis", help="三维轨迹速度 colormap，默认 viridis"
     )
     parser.add_argument(
@@ -115,16 +157,30 @@ def _load_csv(path: Path) -> dict[str, np.ndarray]:
     if table.size < 2:
         raise ValueError(f"{path.name} 至少需要两个采样点")
 
+    optional_columns = DYNAMIC_COLUMNS + HIGH_LEVEL_COLUMNS
+    loaded_columns = list(REQUIRED_COLUMNS) + [
+        name for name in optional_columns if name in table.dtype.names
+    ]
     data = {
         name: np.asarray(table[name], dtype=float).reshape(-1)
-        for name in REQUIRED_COLUMNS
+        for name in loaded_columns
     }
     time = data["t"]
     if not np.all(np.isfinite(time)) or not np.all(np.diff(time) > 0.0):
         raise ValueError(f"{path.name} 的时间必须有限且严格递增")
     for name, values in data.items():
-        if values.shape != time.shape or not np.all(np.isfinite(values)):
-            raise ValueError(f"{path.name} 的字段 {name} 维度错误或包含非有限值")
+        if values.shape != time.shape:
+            raise ValueError(f"{path.name} 的字段 {name} 维度错误")
+        # An infeasible open-loop mapping deliberately exports NaN actuator
+        # values. Preserve them as visible gaps instead of rejecting the valid
+        # trajectory-state columns or drawing a misleading connecting line.
+        if (
+            name not in ACTUATOR_COLUMNS
+            and name not in DYNAMIC_COLUMNS
+            and name not in HIGH_LEVEL_COLUMNS
+            and not np.all(np.isfinite(values))
+        ):
+            raise ValueError(f"{path.name} 的字段 {name} 包含非有限值")
     return data
 
 
@@ -148,21 +204,57 @@ def _apply_style() -> None:
 def _summary_metrics(data: dict[str, np.ndarray]) -> dict[str, float]:
     velocity = np.column_stack((data["vx"], data["vy"], data["vz"]))
     snap = np.column_stack((data["snap_x"], data["snap_y"], data["snap_z"]))
-    peak_rotor = max(
-        float(np.max(data["omega1_pred"])), float(np.max(data["omega2_pred"]))
+
+    def finite_max(values: np.ndarray, absolute: bool = False) -> float:
+        finite = values[np.isfinite(values)]
+        if finite.size == 0:
+            return float("nan")
+        return float(np.max(np.abs(finite) if absolute else finite))
+
+    peak_rotor = finite_max(
+        np.concatenate((data["omega1_pred"], data["omega2_pred"]))
     )
-    peak_flap = max(
-        float(np.max(np.abs(data["delta1_pred"]))),
-        float(np.max(np.abs(data["delta2_pred"]))),
+    peak_flap = finite_max(
+        np.concatenate((data["delta1_pred"], data["delta2_pred"])),
+        absolute=True,
     )
-    return {
+    actuator_values = np.column_stack([data[name] for name in ACTUATOR_COLUMNS])
+    metrics = {
         "duration": float(data["t"][-1] - data["t"][0]),
         "speed": float(np.max(np.linalg.norm(velocity, axis=1))),
         "snap": float(np.max(np.linalg.norm(snap, axis=1))),
         "yaw_acceleration": float(np.max(np.abs(data["yaw_acceleration"]))),
         "rotor": peak_rotor,
         "flap": peak_flap,
+        "invalid_actuator_samples": float(
+            np.count_nonzero(~np.all(np.isfinite(actuator_values), axis=1))
+        ),
     }
+    if all(name in data for name in DYNAMIC_COLUMNS):
+        metrics.update(
+            {
+                "body_rate": finite_max(data["body_rate_norm"]),
+                "flap_rate": finite_max(
+                    np.concatenate((data["flap_rate_1"], data["flap_rate_2"])),
+                    absolute=True,
+                ),
+                "rotor_command": finite_max(
+                    np.concatenate(
+                        (data["omega_cmd_req_1"], data["omega_cmd_req_2"])
+                    ),
+                    absolute=True,
+                ),
+                "flap_command": finite_max(
+                    np.concatenate(
+                        (data["delta_cmd_req_1"], data["delta_cmd_req_2"])
+                    ),
+                    absolute=True,
+                ),
+            }
+        )
+    if "collective_thrust" in data:
+        metrics["collective_thrust"] = finite_max(data["collective_thrust"])
+    return metrics
 
 
 def _print_summary(data: dict[str, np.ndarray], label: str | None = None) -> None:
@@ -178,6 +270,20 @@ def _print_summary(data: dict[str, np.ndarray], label: str | None = None) -> Non
     )
     print(f"peak rotor speed: {metrics['rotor']:.6f} rad/s")
     print(f"peak absolute flap deflection: {metrics['flap']:.6f} rad")
+    if "collective_thrust" in metrics:
+        print(f"peak collective thrust: {metrics['collective_thrust']:.6f} N")
+    if "body_rate" in metrics:
+        print(f"peak body-rate norm: {metrics['body_rate']:.6f} rad/s")
+        print(f"peak absolute flap rate: {metrics['flap_rate']:.6f} rad/s")
+        print(
+            "peak required rotor/flap command: "
+            f"{metrics['rotor_command']:.6f} rad/s, "
+            f"{metrics['flap_command']:.6f} rad"
+        )
+    print(
+        "invalid actuator samples: "
+        f"{int(metrics['invalid_actuator_samples'])}/{data['t'].size}"
+    )
 
 
 def _set_3d_limits(axis: plt.Axes, points: np.ndarray) -> None:
@@ -192,7 +298,10 @@ def _set_3d_limits(axis: plt.Axes, points: np.ndarray) -> None:
     axis.set_xlim(centers[0] - half_widths[0], centers[0] + half_widths[0])
     axis.set_ylim(centers[1] - half_widths[1], centers[1] + half_widths[1])
     axis.set_zlim(centers[2] - half_widths[2], centers[2] + half_widths[2])
-    axis.set_box_aspect(display_spans)
+    # set_box_aspect was added after Matplotlib 3.1, which is still present on
+    # some ROS/Ubuntu workstations used by this project.
+    if hasattr(axis, "set_box_aspect"):
+        axis.set_box_aspect(display_spans)
 
 
 def _plot_speed_trajectory(
@@ -549,10 +658,146 @@ def _plot_actuators_comparison(
     figure.savefig(output, dpi=dpi, bbox_inches="tight")
 
 
+def _plot_dynamic_constraints(
+    datasets: list[dict[str, np.ndarray]],
+    output: Path,
+    title: str,
+    labels: tuple[str, ...],
+    omega_max: float,
+    delta_max: float,
+    body_rate_max: float,
+    servo_rate_max: float,
+    dpi: int,
+) -> None:
+    figure, axes = plt.subplots(
+        4, 1, figsize=(10.2, 10.2), sharex=True, constrained_layout=True
+    )
+    method_styles = ("-", "--", "-.")
+    channel_colors = ("#0072B2", "#D55E00")
+    for data, linestyle in zip(datasets, method_styles):
+        axes[0].plot(
+            data["t"], data["body_rate_norm"], color="black", linestyle=linestyle
+        )
+        for channel, color in enumerate(channel_colors, start=1):
+            axes[1].plot(
+                data["t"],
+                data[f"omega_cmd_req_{channel}"],
+                color=color,
+                linestyle=linestyle,
+            )
+            axes[2].plot(
+                data["t"],
+                data[f"flap_rate_{channel}"],
+                color=color,
+                linestyle=linestyle,
+            )
+            axes[3].plot(
+                data["t"],
+                data[f"delta_cmd_req_{channel}"],
+                color=color,
+                linestyle=linestyle,
+            )
+
+    axes[0].axhline(body_rate_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[0].set_ylabel(r"$\|\Omega\|$ [rad/s]")
+    axes[0].set_title(f"{title}: rate and first-order dynamic constraints", loc="left")
+
+    axes[1].axhline(omega_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[1].axhline(0.0, color="0.35", linewidth=0.8)
+    axes[1].set_ylabel(r"Required $\omega_{cmd}$ [rad/s]")
+
+    axes[2].axhline(servo_rate_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[2].axhline(-servo_rate_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[2].axhline(0.0, color="0.35", linewidth=0.8)
+    axes[2].set_ylabel(r"$\dot{\delta}$ [rad/s]")
+
+    axes[3].axhline(delta_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[3].axhline(-delta_max, color="#7B3294", linestyle=":", linewidth=1.4)
+    axes[3].axhline(0.0, color="0.35", linewidth=0.8)
+    axes[3].set_ylabel(r"Required $\delta_{cmd}$ [rad]")
+    axes[3].set_xlabel("Time [s]")
+
+    channel_handles = [
+        Line2D([0], [0], color=channel_colors[0], label="actuator 1"),
+        Line2D([0], [0], color=channel_colors[1], label="actuator 2"),
+        Line2D([0], [0], color="#7B3294", linestyle=":", label="limit"),
+    ]
+    method_handles = [
+        Line2D([0], [0], color="0.2", linestyle=style, label=label)
+        for style, label in zip(method_styles, labels)
+    ]
+    axes[3].legend(handles=channel_handles + method_handles, ncol=3, loc="best")
+    axes[3].set_xlim(0.0, max(float(data["t"][-1]) for data in datasets))
+    figure.savefig(output, dpi=dpi, bbox_inches="tight")
+
+
+def _plot_high_level_constraints(
+    datasets: list[dict[str, np.ndarray]],
+    output: Path,
+    title: str,
+    labels: tuple[str, ...],
+    velocity_max: float,
+    collective_thrust_max: float,
+    body_rate_max: float,
+    dpi: int,
+) -> None:
+    figure, axes = plt.subplots(
+        3, 1, figsize=(10.2, 8.0), sharex=True, constrained_layout=True
+    )
+    method_styles = ("-", "--", "-.")
+    method_colors = ("#0072B2", "#D55E00", "#009E73")
+    for data, label, linestyle, color in zip(
+        datasets, labels, method_styles, method_colors
+    ):
+        speed = np.linalg.norm(
+            np.column_stack((data["vx"], data["vy"], data["vz"])), axis=1
+        )
+        axes[0].plot(data["t"], speed, color=color, linestyle=linestyle, label=label)
+        axes[1].plot(
+            data["t"],
+            data["collective_thrust"],
+            color=color,
+            linestyle=linestyle,
+            label=label,
+        )
+        axes[2].plot(
+            data["t"],
+            data["body_rate_norm"],
+            color=color,
+            linestyle=linestyle,
+            label=label,
+        )
+
+    limits = (velocity_max, collective_thrust_max, body_rate_max)
+    ylabels = (
+        r"$\|\mathbf{v}\|$ [m/s]",
+        r"Collective thrust $T$ [N]",
+        r"$\|\Omega\|$ [rad/s]",
+    )
+    for axis, limit, ylabel in zip(axes, limits, ylabels):
+        axis.axhline(limit, color="#7B3294", linestyle=":", linewidth=1.4,
+                     label="planning limit")
+        axis.axhline(0.0, color="0.35", linewidth=0.8)
+        axis.set_ylabel(ylabel)
+    axes[0].set_title(f"{title}: high-level constraints", loc="left")
+    axes[0].legend(ncol=min(3, len(labels) + 1), loc="best")
+    axes[2].set_xlabel("Time [s]")
+    axes[2].set_xlim(0.0, max(float(data["t"][-1]) for data in datasets))
+    figure.savefig(output, dpi=dpi, bbox_inches="tight")
+
+
 def main() -> int:
     args = _parse_args()
-    if args.omega_max <= 0.0 or args.delta_max <= 0.0 or args.dpi <= 0:
-        raise ValueError("omega-max、delta-max 和 dpi 必须为正数")
+    if (
+        args.omega_max <= 0.0
+        or args.delta_max <= 0.0
+        or args.body_rate_max <= 0.0
+        or args.servo_rate_max <= 0.0
+        or args.velocity_max <= 0.0
+        or args.collective_thrust_max <= 0.0
+        or args.dpi <= 0
+    ):
+        raise ValueError("各约束上限和 dpi 必须为正数")
 
     csv_path = args.csv.resolve()
     output_dir = (
@@ -583,6 +828,10 @@ def main() -> int:
 
     _apply_style()
     data = _load_csv(csv_path)
+    dynamic_datasets: list[dict[str, np.ndarray]] = []
+    dynamic_labels: tuple[str, ...] = ()
+    high_level_datasets: list[dict[str, np.ndarray]] = []
+    high_level_labels: tuple[str, ...] = ()
     if compare_path is None:
         _print_summary(data)
         _plot_speed_trajectory(
@@ -602,6 +851,15 @@ def main() -> int:
             args.delta_max,
             args.dpi,
         )
+        if all(name in data for name in DYNAMIC_COLUMNS):
+            dynamic_datasets = [data]
+            dynamic_labels = (args.primary_label,)
+        if (
+            all(name in data for name in HIGH_LEVEL_COLUMNS)
+            and "body_rate_norm" in data
+        ):
+            high_level_datasets = [data]
+            high_level_labels = (args.primary_label,)
     else:
         comparison = _load_csv(compare_path)
         datasets = [data, comparison]
@@ -631,6 +889,47 @@ def main() -> int:
             label_tuple,
             args.omega_max,
             args.delta_max,
+            args.dpi,
+        )
+        if all(all(name in dataset for name in DYNAMIC_COLUMNS) for dataset in datasets):
+            dynamic_datasets = datasets
+            dynamic_labels = label_tuple
+        if all(
+            all(name in dataset for name in HIGH_LEVEL_COLUMNS)
+            and "body_rate_norm" in dataset
+            for dataset in datasets
+        ):
+            high_level_datasets = datasets
+            high_level_labels = label_tuple
+
+    if dynamic_datasets:
+        outputs["dynamic_constraints"] = (
+            output_dir / f"{prefix}_dynamic_constraints.{suffix}"
+        )
+        _plot_dynamic_constraints(
+            dynamic_datasets,
+            outputs["dynamic_constraints"],
+            title,
+            dynamic_labels,
+            args.omega_max,
+            args.delta_max,
+            args.body_rate_max,
+            args.servo_rate_max,
+            args.dpi,
+        )
+
+    if high_level_datasets:
+        outputs["high_level_constraints"] = (
+            output_dir / f"{prefix}_high_level_constraints.{suffix}"
+        )
+        _plot_high_level_constraints(
+            high_level_datasets,
+            outputs["high_level_constraints"],
+            title,
+            high_level_labels,
+            args.velocity_max,
+            args.collective_thrust_max,
+            args.body_rate_max,
             args.dpi,
         )
 

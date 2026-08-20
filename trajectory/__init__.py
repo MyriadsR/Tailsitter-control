@@ -8,6 +8,7 @@ from .test import (
     LemniscateTrajectory,
     TrajectoryGenerator,
 )
+from .planning_csv import PlanningCsvTrajectory
 
 __all__ = [
     "TrajectoryGenerator",
@@ -16,4 +17,5 @@ __all__ = [
     "CircularTrajectory",
     "CircularTransitionTrajectory",
     "DifferentialThrustTurnTrajectory",
+    "PlanningCsvTrajectory",
 ]

@@ -4,4 +4,8 @@ c_T: 1.8e-6
 c_mu: 2.2e-8
 omega_max: 2500.0
 delta_max: 1.0
-
+body_rate_max: 11.344640137963141
+velocity_max: 8.0
+motor_time_constant: 0.04
+servo_time_constant: 0.03
+servo_rate_max: 25.0

@@ -47,6 +47,15 @@ struct VehicleParameters
     double omega_min{0.0};
     double omega_max{2500.0};
     double delta_max{1.0};
+    // Planning/reference envelope from the reported 650 deg/s maneuver peak.
+    // This is not a manufacturer-certified hardware rate limit.
+    double body_rate_max{650.0 * 3.14159265358979323846 / 180.0};
+    // Reference translational-speed envelope for the high-level planner.
+    double velocity_max{8.0};
+    // Engineering estimates shared with config.py/main_sim.py.
+    double motor_time_constant{0.04};
+    double servo_time_constant{0.03};
+    double servo_rate_max{25.0};
     double velocity_regularization{1e-3};
     double singularity_tolerance{1e-9};
 
@@ -75,7 +84,30 @@ struct ActuatorPrediction
     double flap_1{std::numeric_limits<double>::quiet_NaN()};
     double flap_2{std::numeric_limits<double>::quiet_NaN()};
     double flap_matrix_min_singular_value{0.0};
+    int roll_branch{-1};
+    int pitch_branch{-1};
     bool valid{false};
+    std::string failure_reason;
+};
+
+struct ActuatorLinearization
+{
+    static constexpr int flat_derivative_dimension = 15;
+    static constexpr int actuator_dimension = 4;
+    static constexpr int velocity_offset = 0;
+    static constexpr int acceleration_offset = 3;
+    static constexpr int jerk_offset = 6;
+    static constexpr int snap_offset = 9;
+    static constexpr int yaw_index = 12;
+    static constexpr int yaw_rate_index = 13;
+    static constexpr int yaw_acceleration_index = 14;
+
+    ActuatorPrediction prediction;
+    Eigen::Matrix<double, actuator_dimension, flat_derivative_dimension> jacobian{
+        Eigen::Matrix<double, actuator_dimension, flat_derivative_dimension>::Zero()};
+    Eigen::Matrix<double, 3, flat_derivative_dimension> angular_velocity_jacobian{
+        Eigen::Matrix<double, 3, flat_derivative_dimension>::Zero()};
+    bool differentiable{false};
     std::string failure_reason;
 };
 
@@ -85,10 +117,15 @@ struct FeasibilityReport
     double max_normalized_violation{-std::numeric_limits<double>::infinity()};
     double peak_rotor_speed{0.0};
     double peak_flap_deflection{0.0};
+    double peak_body_rate{0.0};
+    double peak_velocity{0.0};
+    double peak_collective_thrust{0.0};
+    double peak_flap_rate{0.0};
+    double peak_required_rotor_command{0.0};
+    double peak_required_flap_command{0.0};
     double first_failure_time{std::numeric_limits<double>::quiet_NaN()};
     std::string first_failure_reason;
     std::vector<ActuatorPrediction> predictions;
 };
 
 }  // namespace planning
-

@@ -1,4 +1,4 @@
-# planning 阶段 A 项目详解
+# planning 阶段 A/B 项目详解
 
 ## 目录
 
@@ -15,14 +15,17 @@
 11. [回归测试逐项说明](#11-回归测试逐项说明)
 12. [当前限制与后续开发方向](#12-当前限制与后续开发方向)
 13. [阅读代码的推荐顺序](#13-阅读代码的推荐顺序)
+    - [阶段 B：执行器采样积分罚函数与辅助航点联合优化](#阶段-b执行器采样积分罚函数与辅助航点联合优化)
 14. [SepticSplineND 的数学原理与逐函数说明](#14-septicsplinend-的数学原理与逐函数说明)
 15. [Jet2 与 tailsitter_flatness.cpp 逐行数学说明](#15-jet2-与-tailsitter_flatnesscpp-逐行数学说明)
+16. [借鉴 paper_manifold 规划并使用 paper_control 闭环跟踪](#16-借鉴-paper_manifold-规划并使用-paper_control-闭环跟踪)
+17. [Stage B 执行器约束梯度与 L-BFGS](#17-stage-b-执行器约束梯度与-l-bfgs)
 
 ---
 
 ## 1. 项目目标
 
-`planning/` 实现了 `paper_planning` 的第一阶段轨迹生成流程：
+`planning/` 首先实现了 `paper_planning` 的阶段 A 轨迹生成流程：
 
 1. 给定固定的位置和 yaw 航点；
 2. 在固定总时间内优化各段时间比例；
@@ -73,7 +76,9 @@ paper_planning 开环平坦变换
 选择最小可行缩放系数
 ```
 
-这里实现的是阶段 A，而不是第 13 章所讨论的位置、时间和执行器约束联合优化。几何航点在整个优化过程中不会移动，执行器约束也没有被写入 L-BFGS 的目标函数或梯度中。
+在此基础上，阶段 B 新增执行器采样积分罚函数：保持关键航点与总时间固定，
+联合调整分段时间和一个辅助支撑点，但不再执行外层时间缩放。阶段 B 是软罚函数
+优化，最终仍保留独立的稠密前向可行性检查。
 
 ---
 
@@ -91,21 +96,25 @@ planning/
 │   ├── planning_types.hpp
 │   ├── flat_output_trajectory.hpp
 │   ├── time_allocation.hpp
+│   ├── actuator_penalty_optimizer.hpp
 │   ├── tailsitter_flatness.hpp
 │   ├── feasibility_checker.hpp
 │   └── time_scaler.hpp
 ├── src/
 │   ├── flat_output_trajectory.cpp
 │   ├── time_allocation.cpp
+│   ├── actuator_penalty_optimizer.cpp
 │   ├── tailsitter_flatness.cpp
 │   ├── feasibility_checker.cpp
 │   └── time_scaler.cpp
 ├── apps/
-│   └── generate_simple_trajectory.cpp
+│   ├── generate_simple_trajectory.cpp
+│   └── generate_stage_b_trajectory.cpp
 ├── scripts/
 │   └── plot_planning_metrics.py
 ├── tests/
-│   └── test_stage_a.cpp
+│   ├── test_stage_a.cpp
+│   └── test_stage_b.cpp
 └── third_party/
     └── SplineTrajectory/          # Git submodule
 ```
@@ -117,12 +126,15 @@ planning/
 | `planning_types` | 无 | 公共数据类型 | 定义轨迹采样、车辆参数和可行性报告 |
 | `flat_output_trajectory` | 航点、分段时间 | 平坦输出及各阶导数 | 包装位置和 yaw 两套样条 |
 | `time_allocation` | 固定总时间、航点 | 最优分段时间 | 优化平滑能量且保持总时间不变 |
-| `tailsitter_flatness` | 单个平坦输出采样 | 原始执行器预测 | 实现论文开环式 (20)～(56) |
+| `actuator_penalty_optimizer` | 固定总时间、关键/辅助点、原始执行器映射 | 分段时间和辅助点 | 对四个执行器输入的采样违反量积分并联合优化 |
+| `tailsitter_flatness` | 单个平坦输出采样 | 原始执行器预测及固定分支雅可比 | 实现论文开环式 (20)～(56) |
 | `feasibility_checker` | 完整组合轨迹 | 可行性报告 | 稠密调用开环映射并检查限制 |
 | `time_scaler` | 基础分段时间、航点 | 最小可行缩放结果 | 粗扫描加切换区间二分 |
 | `generate_simple_trajectory` | 命令行选项 | 控制台报告和 CSV | 串起阶段 A 的完整示例 |
+| `generate_stage_b_trajectory` | 固定总时间和罚函数参数 | 阶段 A/B 两份 CSV | 串起阶段 B 并提供同口径基线 |
 | `plot_planning_metrics.py` | 规划 CSV | 三类规划指标图 | 绘制速度着色轨迹、平滑性和执行器预测 |
 | `test_stage_a` | 固定测试轨迹 | 测试通过/失败 | 验证梯度、动力学重构和边界行为 |
+| `test_stage_b` | 固定关键点和一个辅助点 | 测试通过/失败 | 验证执行器雅可比、完整目标梯度和优化不变量 |
 
 ---
 
@@ -130,11 +142,13 @@ planning/
 
 ### 3.1 CMake 目标
 
-`CMakeLists.txt` 要求 C++17，并生成三个目标：
+`CMakeLists.txt` 要求 C++17，并生成五个目标：
 
-- `tailsitter_planning`：包含五个核心 `.cpp` 文件的库目标，默认构建为静态库；
+- `tailsitter_planning`：包含六个核心 `.cpp` 文件的库目标，默认构建为静态库；
 - `generate_simple_trajectory`：简单轨迹生成程序；
+- `generate_stage_b_trajectory`：阶段 B 执行器罚函数联合优化程序；
 - `test_stage_a`：由 CTest 调用的阶段 A 回归测试。
+- `test_stage_b`：由 CTest 调用的阶段 B 回归测试。
 
 依赖包括：
 
@@ -151,7 +165,8 @@ cmake -S planning -B planning/build \
 
 ### 3.2 为什么使用 SplineTrajectory
 
-本项目只复用 SplineTrajectory 的样条构造、求值、能量和解析时间梯度：
+本项目复用 SplineTrajectory 的样条构造、求值、能量，以及对时间、内部航点和
+多项式系数偏导的解析反向传播：
 
 ```cpp
 using PositionSpline = SplineTrajectory::SepticSplineND<3>;
@@ -162,7 +177,9 @@ using YawSpline = SplineTrajectory::CubicSplineND<1>;
 - 三次样条最小化二阶导数平方积分，对应 minimum-yaw-acceleration / MINCO S2；
 - 两套样条使用完全相同的物理分段时间。
 
-当前没有使用 SplineTrajectory 自带的完整 `SplineOptimizer`。原因是本阶段只需要联合两种不同阶次样条的能量，并共享一个时间变量，直接调用 `getEnergy()` 和 `getEnergyGradTimes()` 更清楚。
+当前没有使用 SplineTrajectory 自带的完整 `SplineOptimizer`。原因是位置和 yaw
+使用不同阶次样条、共享同一组时间，而且阶段 B 还要注入执行器罚函数对系数和
+时间的偏导；直接组合 `getEnergyGrad()` 与 `propagateGrad()` 更清楚。
 
 ---
 
@@ -184,7 +201,8 @@ yaw 部分：psi, psi_dot, psi_ddot, psi_jerk
 - 位置到 Snap；
 - yaw 到 yaw acceleration。
 
-`crackle` 和 `yaw_jerk` 已预留，便于以后实现更高阶代价、连续时间梯度或执行器速率约束。
+`crackle` 和 `yaw_jerk` 不参与当前时刻的执行器值恢复，但已用于执行器积分对
+分段时间的移动采样点梯度；以后还可用于执行器速率约束。
 
 ### 4.2 `VehicleParameters`
 
@@ -222,11 +240,20 @@ yaw 部分：psi, psi_dot, psi_ddot, psi_jerk
 - 两个电机转速；
 - 两个舵面偏角；
 - 舵面分配矩阵最小奇异值；
+- 当前选中的 roll/pitch 离散分支编号；
 - 数值映射是否有效及失败原因。
 
 `valid=true` 只表示：公式计算成功、没有奇异矩阵、没有负单电机推力、结果均为有限数。它不表示执行器没有超过上限。执行器范围由 `FeasibilityChecker` 另外判断。
 
-### 4.5 `FeasibilityReport`
+### 4.5 `ActuatorLinearization`
+
+该结构在一份普通 `ActuatorPrediction` 之外保存固定姿态分支下的
+$4\times15$ 执行器雅可比、`differentiable` 标志和失败原因。15 列的顺序为
+速度、加速度、Jerk、Snap 各三维，再接 yaw、yaw rate 和 yaw acceleration；
+四行依次是 $T_1,T_2,\delta_1,\delta_2$。它只描述当前有效分支的局部导数，
+不包含分支选择逻辑的导数。
+
+### 4.6 `FeasibilityReport`
 
 报告汇总：
 
@@ -1096,16 +1123,19 @@ cmake --build planning/build -j
 
 下一步需要扩展样条等式约束系统，或实现带导数掩码的稀疏多项式求解器。高权重罚函数只能近似满足中间导数，不能视为严格等式复现。
 
-### 12.2 还不是联合优化
+### 12.2 阶段 B 仍不是显式约束优化
 
-当前 L-BFGS 只优化固定总时间内的时间比例，不优化：
+阶段 A 的 L-BFGS 只优化固定总时间内的时间比例。阶段 B 已经能够联合优化
+分段时间和一个辅助位置点，并加入执行器采样积分罚函数，但仍未实现：
 
-- 中间位置；
-- 中间 yaw；
-- 几何走廊；
-- 执行器约束罚函数。
+- 可移动的关键机动点或中间 yaw；
+- 几何走廊和中间导数等式约束；
+- 执行器显式不等式约束；
 
-第 13 章的联合优化需要把开环平坦映射对样条状态的梯度继续传播到航点和时间变量，或者使用自动微分/数值梯度构建非线性约束。
+阶段 B 现已将开环平坦映射的固定分支自动微分雅可比，继续传播到样条系数、
+航点和分段时间，并使用 L-BFGS 求解软罚函数目标。阶段 C 若要把采样罚函数升级
+为显式不等式硬约束，仍需要改用 SQP、IPOPT 或增广拉格朗日等约束优化方法，
+并处理姿态分支切换点与无效映射区域的非光滑性。
 
 ### 12.3 可行性仍是采样意义上的
 
@@ -1296,6 +1326,929 @@ python3 planning/scripts/plot_planning_metrics.py \
 对比图的默认文件名会包含前两份 CSV 的 stem；三组对比建议像示例一样使用
 `--prefix` 指定清晰的固定名称。终端会按所有配置分别打印六个峰值/时长指标，
 方便将图片与数值回归结果相互核对。
+
+---
+
+## 阶段 B：执行器采样积分罚函数与辅助航点联合优化
+
+阶段 B 对应根目录 `study.md` 第 13.6 节的第二步。新实现位于：
+
+```text
+include/planning/actuator_penalty_optimizer.hpp
+src/actuator_penalty_optimizer.cpp
+apps/generate_stage_b_trajectory.cpp
+tests/test_stage_b.cpp
+```
+
+它复用阶段 A 的 `FlatOutputTrajectory` 和 `TailsitterFlatness`，不复制或修改
+开环平坦映射。为避免符号混淆，本节用 $\Delta t_i$ 表示第 $i$ 段轨迹时间，
+继续用 $T_1,T_2$ 表示两台电机的原始单电机推力。
+
+### B.1 与阶段 A 的边界
+
+阶段 B 的处理链为：
+
+```text
+固定总时间、固定关键位置/yaw 航点
+                │
+                ▼
+阶段 A 平滑能量时间分配作为初值
+                │
+                ▼
+softmax 分段时间 + 有界辅助点变量
+                │
+                ▼
+每个候选变量重新构造位置/yaw 样条
+                │
+                ▼
+分段采样 paper_planning 开环平坦映射
+                │
+                ▼
+T1、T2、delta1、delta2 违反量梯形积分
+                │
+                ▼
+固定分支解析梯度 + 有界 L-BFGS 联合优化
+                │
+                ▼
+2 ms 稠密物理限制复核和 CSV 导出
+```
+
+该程序**没有创建或调用 `TimeScaler`**。总时间从优化开始到结束严格固定为
+
+$$
+\boxed{\bar T=1.8\ \mathrm s}
+$$
+
+（可用 `--total-time` 修改）。所以阶段 B 输出时间的变化只发生在各段之间，
+不存在优化结束后的统一乘法缩放。
+
+### B.2 固定关键点与一个自由辅助点
+
+简单验证保留原来的三个关键点：
+
+$$
+\mathbf p_0=(0,0,-10),\qquad
+\mathbf p_1=(1.5,0,-10),\qquad
+\mathbf p_2=(6,0,-10).
+$$
+
+在后两个关键点之间加入名义辅助点：
+
+$$
+\mathbf q^0=(3.75,0,-10).
+$$
+
+位置航点顺序为：
+
+$$
+[\mathbf p_0,\mathbf p_1,\mathbf q,\mathbf p_2].
+$$
+
+其中 $\mathbf p_0,\mathbf p_1,\mathbf p_2$ 始终不进入几何优化变量，只有
+$\mathbf q$ 可动。程序使用归一化变量 $\mathbf u\in[-1,1]^3$：
+
+$$
+\boxed{
+\mathbf q=\mathbf q^0+
+\operatorname{diag}(0.5,0.5,0.5)\mathbf u
+}.
+$$
+
+这使辅助点只能在名义位置周围的 $1\ \mathrm m$ 立方盒内移动，不能通过任意
+扭曲或缩小轨迹逃避执行器罚函数。yaw 航点同样固定：零偏航工况全部为零；
+`--yaw-pi` 工况为
+
+$$
+[0,\pi/2,3\pi/4,\pi].
+$$
+
+辅助点的 yaw 只是固定插值值，本阶段没有优化 yaw 航点。
+
+### B.3 固定总时间的分段时间变量
+
+四个航点产生三个分段。最后一个 logit 固定为零，只优化两个自由变量
+$\tau_1,\tau_2$：
+
+$$
+\begin{aligned}
+\Delta t_1&=\bar T\frac{e^{\tau_1}}
+{e^{\tau_1}+e^{\tau_2}+1},\\
+\Delta t_2&=\bar T\frac{e^{\tau_2}}
+{e^{\tau_1}+e^{\tau_2}+1},\\
+\Delta t_3&=\bar T\frac{1}
+{e^{\tau_1}+e^{\tau_2}+1}.
+\end{aligned}
+$$
+
+因此任意优化迭代都严格满足：
+
+$$
+\Delta t_i>0,
+\qquad
+\sum_{i=1}^3\Delta t_i=\bar T.
+$$
+
+默认限制 $\tau_i\in[-5,5]$，防止某段时间在数值上退化到接近零。
+
+### B.4 四个执行器输入的罚函数
+
+规划器直接使用 `TailsitterFlatness::forward()` 的原始输出：
+
+$$
+T_1(t),\quad T_2(t),\quad\delta_1(t),\quad\delta_2(t).
+$$
+
+不对这些量做 `clip`。令规划裕量为 $m\in(0,1]$，优化阶段使用：
+
+$$
+T_{\min}=c_T\omega_{\min}^2,
+\qquad
+T_{\max}^{\mathrm{plan}}=c_T(m\omega_{\max})^2,
+$$
+
+$$
+\delta_{\max}^{\mathrm{plan}}=m\delta_{\max}.
+$$
+
+推力范围 $\Delta T=T_{\max}^{\mathrm{plan}}-T_{\min}$。代码中的单电机
+归一化平方铰链罚函数为：
+
+$$
+p_{T_i}(t)=
+\left[
+\frac{T_{\min}-T_i(t)}{\Delta T}
+\right]_+^2
++
+\left[
+\frac{T_i(t)-T_{\max}^{\mathrm{plan}}}{\Delta T}
+\right]_+^2,
+$$
+
+其中 $[x]_+=\max(0,x)$。单舵面罚函数为：
+
+$$
+p_{\delta_i}(t)=
+\left[
+\frac{|\delta_i(t)|-\delta_{\max}^{\mathrm{plan}}}
+{\delta_{\max}^{\mathrm{plan}}}
+\right]_+^2.
+$$
+
+平方铰链在约束边界处一阶连续。当前实现显式计算其一阶导数，并通过执行器
+雅可比、样条系数和时间映射传播给优化变量。如果平坦映射无效或输出非有限值，
+额外加入 `invalid_mapping_penalty`，使优化器倾向离开负推力、奇异分配或姿态
+分支失败区域。
+
+默认 $m=0.75$，对应优化阶段约：
+
+```text
+omega plan max = 1875 rad/s
+delta plan max = 0.75 rad
+```
+
+这个较保守的默认值是为了让简单 `1.8 s` 验证轨迹产生可观察的阶段 A/B
+差异。它不是车辆物理上限；最终验证仍使用 `2500 rad/s` 和 `1 rad`。
+
+### B.5 分段梯形积分
+
+每一段单独均匀划分为 $N$ 个区间，默认 $N=50$。对任一执行器罚函数
+$p(t)$，第 $i$ 段的积分近似为：
+
+$$
+I_i[p]
+=\frac{\Delta t_i}{N}
+\left[
+\frac12p(t_{i,0})
++\sum_{k=1}^{N-1}p(t_{i,k})
++\frac12p(t_{i,N})
+\right].
+$$
+
+总执行器罚函数为：
+
+$$
+\boxed{
+J_{\mathrm{act}}
+=I[p_{T_1}]+I[p_{T_2}]
++I[p_{\delta_1}]+I[p_{\delta_2}]
++I[p_{\mathrm{invalid}}]
+}.
+$$
+
+逐段积分保证所有样条连接点都被显式采样。积分阶段使用的 `50` 个区间用于
+优化速度与约束分辨率之间的折中；优化完成后另外使用 `2 ms` 间隔检查，不把
+积分网格本身当成连续时间证明。
+
+### B.6 完整目标函数与默认权重
+
+阶段 B 的目标为：
+
+$$
+\boxed{
+J_B
+=\rho_s\frac{J_{\mathrm{smooth}}}{J_{\mathrm{smooth}}^0}
++\rho_g\|\mathbf u\|^2
++\rho_aJ_{\mathrm{act}}
+}.
+$$
+
+其中：
+
+$$
+J_{\mathrm{smooth}}
+=J_{\mathrm{snap}}+\lambda_\psi J_{\mathrm{yawacc}},
+\qquad \lambda_\psi=1.
+$$
+
+$J_{\mathrm{smooth}}^0$ 是阶段 A 初始轨迹的平滑能量，用它归一化可以避免
+位置 Snap 能量的数值量级随总时间剧烈变化。默认配置为：
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| $\rho_s$ | 1 | 归一化平滑能量权重 |
+| $\rho_g$ | 0.05 | 辅助点偏移权重 |
+| $\rho_a$ | 200 | 执行器积分罚权 |
+| $\lambda_\psi$ | 1 | yaw 加速度能量权重 |
+| $m$ | 0.75 | 优化用执行器幅值裕量 |
+| $N$ | 50/段 | 罚函数积分区间数 |
+
+因此阶段 B 并不保证 Snap 单独下降。优化器允许小幅增加平滑能量，以交换更低
+的执行器罚函数；这正是和阶段 A “只最小化平滑能量”之间的本质差异。
+
+### B.7 为什么现在使用固定分支梯度和 `LD_LBFGS`
+
+优化变量只有五个：
+
+```text
+2 个自由时间 logits
+3 个辅助点归一化坐标
+```
+
+尾座式开环映射包含姿态离散分支选择、负推力提前返回和舵面矩阵奇异性判断，
+因此整个映射并非处处光滑。不过，姿态分支一旦确定，正常有效区域内从
+
+$$
+\boldsymbol\xi=(\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi)\in\mathbb R^{15}
+$$
+
+到 $(T_1,T_2,\delta_1,\delta_2)$ 的连续公式是可微的。实现先用普通
+`forward()` 选择与前一样本连续的 roll/pitch 分支，再在
+`linearize()` 中冻结这两个分支，用 Eigen AutoDiff 一次得到 $4\times15$
+雅可比。离散 `argmin` 本身不参与求导。
+
+执行器罚函数梯度随后传播到位置/yaw 多项式系数和显式分段时间偏导，再通过
+SplineTrajectory 的 `propagateGrad()` 得到内部航点与分段时间梯度。最后继续
+通过固定总时间 softmax 和辅助点缩放映射传播到五个优化变量。NLopt 因而改用
+有界梯度算法 `LD_LBFGS`。
+
+该梯度是**分段解析梯度**：在当前姿态分支与有效映射邻域内成立，不对分支切换
+边界求导。无效映射罚值仍作为常数屏障处理，不能把它解释为穿越奇异区域的可靠
+搜索方向。
+
+### B.8 与阶段 A 的公平对比
+
+`generate_stage_b_trajectory` 每次同时生成两份轨迹：
+
+- 阶段 A 基线：同样的关键点、名义辅助点和固定总时间，只优化平滑能量的
+  分段比例；
+- 阶段 B：从阶段 A 时间比例开始，加入执行器罚函数并允许辅助点在有界盒内
+  移动。
+
+两者都不进行外层时间缩放。默认 paper 参数的当前结果为：
+
+| yaw | 方法 | 分段时间 `[s]` | 辅助点 `[m]` | 峰值 Snap `[m/s^4]` | 峰值 yaw 加速度 `[rad/s^2]` | 峰值电机 `[rad/s]` | 峰值舵角 `[rad]` |
+| --- | --- | --- | --- | ---: | ---: | ---: | ---: |
+| `0 -> 0` | 阶段 A | `[0.681927, 0.322317, 0.795756]` | `[3.750000, 0, -10.000000]` | 480.109739 | 0 | 1896.658033 | 0.789456 |
+| `0 -> 0` | 阶段 B | `[0.678399, 0.325646, 0.795955]` | `[3.748868, 0, -9.992095]` | 519.406884 | 0 | 1888.207614 | 0.741916 |
+| `0 -> pi` | 阶段 A | `[0.681944, 0.322316, 0.795739]` | `[3.750000, 0, -10.000000]` | 480.160296 | 11.717283 | 1943.519382 | 0.608002 |
+| `0 -> pi` | 阶段 B | `[0.689912, 0.325404, 0.784684]` | `[3.727321, 0.010638, -9.974084]` | 572.975170 | 11.447086 | 1903.552637 | 0.603513 |
+
+零偏航的执行器积分从约 $2.30\times10^{-4}$ 降至
+$2.8\times10^{-5}$；`0 -> pi` 工况从约 $7.27\times10^{-4}$ 降至
+$8.3\times10^{-5}$。同时组合目标分别从 `1.045824` 降到 `1.011050`、从
+`1.145326` 降到 `1.045637`。表中 Snap 上升是目标权衡的正常结果，不是
+minimum-snap 求解错误。
+
+运行和绘图：
+
+```bash
+./planning/build/generate_stage_b_trajectory \
+  --yaw-pi \
+  --output planning/output/stage_b_yaw_pi_optimized.csv \
+  --baseline-output planning/output/stage_b_yaw_pi_baseline.csv
+
+python3 planning/scripts/plot_planning_metrics.py \
+  planning/output/stage_b_yaw_pi_optimized.csv \
+  --compare-csv planning/output/stage_b_yaw_pi_baseline.csv \
+  --primary-label "Stage B: actuator penalty" \
+  --compare-label "Stage A: smoothness only" \
+  --prefix stage_b_vs_stage_a_yaw_pi \
+  --title "Fixed total time 1.8 s, yaw 0 to pi" \
+  --omega-max 1875 \
+  --delta-max 0.75
+```
+
+这里的两条绘图限制线对应阶段 B 的软罚阈值。平方积分罚函数不是硬约束，
+所以最终峰值仍可能略高于线；物理极限的稠密检查结果由生成程序另外报告。
+
+### B.9 当前限制
+
+- 这是平方铰链软罚函数，不是阶段 C 的显式不等式硬约束；
+- 罚函数只在有限采样点积分，采样间的窄峰值仍可能漏检；
+- 当前只优化一个辅助位置点，不优化辅助 yaw 或中间导数；
+- 固定分支梯度不包含离散姿态分支切换导数；无效映射区的常数屏障也不提供可靠
+  的恢复方向，因此初值应处于有效且分支连续的邻域；
+- 默认 `0.75` 裕量是验证配置，需要针对真实平台噪声、模型误差和任务速度
+  重新标定；
+- 最终稠密检查只认证当前开环模型，不替代 `paper_control` 闭环仿真。
+
+### B.10 头文件中的公共类型逐项说明
+
+`actuator_penalty_optimizer.hpp` 把优化器对外接口分成五个数据结构和一个类，
+避免命令行程序直接依赖 NLopt 回调内部状态。
+
+#### B.10.1 `ActuatorPenaltyConfig`
+
+该结构保存构造目标函数和配置求解器所需的全部参数：
+
+| 字段 | 默认值 | 在代码中的用途 |
+| --- | ---: | --- |
+| `yaw_weight` | `1.0` | 传给 `FlatOutputTrajectory::energy()`，即 $\lambda_\psi$ |
+| `smoothness_weight` | `1.0` | 乘归一化后的 Snap/yaw 平滑能量 |
+| `actuator_weight` | `200.0` | 乘四执行器积分与无效映射积分 |
+| `geometry_weight` | `0.05` | 乘辅助点归一化偏移平方和 |
+| `actuator_margin` | `0.75` | 把物理幅值转换成优化用软阈值 |
+| `samples_per_segment` | `50` | 每段梯形积分的区间数，不是点数 |
+| `invalid_mapping_penalty` | `10.0` | 单位时间无效平坦映射的基础罚值 |
+| `auxiliary_half_range` | `[0.5,0.5,0.5]` m | 将 $[-1,1]^3$ 映射到辅助点物理偏移 |
+| `tau_bound` | `5.0` | 时间 logits 的对称上下界 |
+| `max_evaluations` | `400` | NLopt 最大目标函数调用次数 |
+| `relative_tolerance` | `1e-7` | `ftol_rel` 和 `xtol_rel` 共用的相对容差 |
+
+`samples_per_segment=50` 表示每段实际求值 `51` 次，因为两个端点也要参加
+梯形积分。三个分段名义上会调用 `forward()` 共 `153` 次；相邻分段共享的
+连接点会各作为前一段右端点和后一段左端点求值一次。两次分别乘左右分段步长
+的一半；当分段步长不相等时两个权重也不相等，这正是逐段应用梯形公式应有的
+结果，而不是重复积分。
+
+`auxiliary_half_range` 是逐轴尺度，不是球形半径。如果以后设置为
+`[1.0,0.2,0.5]`，含义是允许辅助点沿 x/y/z 分别移动 `±1.0/±0.2/±0.5 m`。
+
+#### B.10.2 `ActuatorPenaltyIntegral`
+
+该结构分别保存：
+
+```cpp
+thrust_1, thrust_2, flap_1, flap_2, invalid_mapping
+```
+
+而不是只保存一个总数。`total()` 才将五项相加。这样控制台能够指出优化器
+主要在处理哪一个执行器，而不会让左右电机或左右舵面的违反量相互掩盖。
+
+这些量都是“归一化违反量平方对时间的积分”，因此仍带有时间尺度。它们不是
+推力能量、转速能量或舵机功耗，也不能直接解释为焦耳。
+
+#### B.10.3 `StageBObjectiveTerms`
+
+该结构保存一次候选变量评估的完整分解：
+
+| 字段 | 含义 |
+| --- | --- |
+| `smoothness` | 未归一化的 $J_{\mathrm{snap}}+\lambda_\psi J_{\mathrm{yawacc}}$ |
+| `normalized_smoothness` | `smoothness / smoothness_reference` |
+| `geometry` | 所有辅助点归一化变量的平方和 |
+| `actuator` | 五个执行器/无效映射积分分量 |
+| `total` | 乘完三个权重后的最终 NLopt 标量目标 |
+
+保留原始和归一化平滑能量非常重要：前者便于和阶段 A 的能量输出核对，后者
+才是阶段 B 目标中实际参与加权的量。
+
+#### B.10.4 `StageBOptimizationResult`
+
+结果结构同时返回：
+
+- `optimized`：NLopt 是否正常返回；
+- `evaluations`：优化回调的实际调用次数；
+- `durations`：解码后的物理分段时间；
+- `position_waypoints`：只修改了指定辅助行的最终位置矩阵；
+- `initial_terms`、`final_terms`：组合目标优化前后的完整分解。
+
+`optimized=true` **不等价于** `FeasibilityReport::feasible=true`。前者只说明
+数值求解器结束，后者才说明随后使用物理限制进行的稠密开环检查通过。
+
+#### B.10.5 `StageBGradientCheckResult`
+
+该结构保存 `checkInitialGradient()` 的验证结果：有效标志、最大缩放分量误差，
+以及逐变量的解析梯度和中心有限差分梯度。它只用于测试与诊断，不参与 NLopt
+迭代，也不会用有限差分结果替换优化器梯度。
+
+#### B.10.6 `ActuatorPenaltyOptimizer`
+
+类本身只持有两项：
+
+```cpp
+TailsitterFlatness flatness_;
+ActuatorPenaltyConfig config_;
+```
+
+平坦映射按值持有，使优化器在多次目标评估期间使用完全一致的车辆参数；配置
+也按值持有，避免命令行层修改临时结构后影响正在运行的优化。
+
+公共方法 `optimize()` 接收名义航点、固定 yaw、初始分段时间和辅助点行号。
+`checkInitialGradient()` 使用相同输入在阶段 A 初值处进行完整目标中心差分检查。
+关键点无需另建布尔掩码：没有出现在 `auxiliary_waypoint_indices` 中的行天然固定。
+
+### B.11 优化变量向量的精确内存布局
+
+阶段 B 没有直接把 Eigen 航点矩阵交给 NLopt，而是构造一个低维
+`std::vector<double>`。设位置航点数为 $M$、辅助点数为 $K$，则分段数为
+$M-1$，自由时间 logits 数为：
+
+$$
+n_\tau=(M-1)-1=M-2.
+$$
+
+函数 `tauCount()` 因此直接返回 `positions.rows() - 2`。变量总维数为：
+
+$$
+n_x=n_\tau+3K.
+$$
+
+当前简单例中 $M=4,K=1$，所以：
+
+$$
+\boxed{
+\mathbf x=[\tau_1,\tau_2,u_x,u_y,u_z]^T
+}.
+$$
+
+一般情况下，第 $a$ 个辅助点、第 `axis` 个轴对应的变量下标为：
+
+```cpp
+tau_count + 3 * auxiliary + axis
+```
+
+这种布局使变量边界也很直接：前 `tau_count` 项使用
+`[-tau_bound,+tau_bound]`，后面所有辅助点归一化变量统一使用 `[-1,+1]`。
+
+### B.12 `positionsFromVariables()`：只解码辅助点
+
+该函数先完整复制名义位置矩阵：
+
+```cpp
+auto positions = *context.nominal_positions;
+```
+
+然后只遍历 `auxiliary_indices` 指定的行。对第 $a$ 个辅助点：
+
+$$
+p_{r,k}=p^0_{r,k}+h_k u_{a,k},
+$$
+
+其中 $r$ 是该辅助点在位置矩阵中的行号，$h_k$ 是
+`auxiliary_half_range[k]`。由于其他行从未被写入，关键点固定不是靠一个大罚权
+近似实现，而是由变量参数化严格保证。
+
+函数返回一个新的位置矩阵，不修改调用者传入的名义矩阵。这一点允许同一个
+`ObjectiveContext` 安全评估大量不同候选变量。
+
+### B.13 `durationsFromVariables()`：复用阶段 A 的 softmax
+
+该函数截取变量向量开头的 $n_\tau$ 项，再调用：
+
+```cpp
+FixedTotalTimeAllocator::durationsFromTau(total_time, tau_free)
+```
+
+因此阶段 B 没有维护第二套时间参数化。数值稳定的“减最大 logit 再指数化”、
+最后一个固定零 logit、严格保持总时间等性质与阶段 A 完全相同。
+
+初始变量不是重新猜测，而是由阶段 A 分段时间反算：
+
+$$
+\tau_i^0=\log\frac{\Delta t_i^0}{\Delta t_N^0}.
+$$
+
+将该式再送入 softmax 会恢复原阶段 A 时间比例，所以
+`initial_terms` 确实对应应用层导出的阶段 A baseline，而不是另一个近似初值。
+
+### B.14 `squaredPositivePartWithDerivative()`：约束边界行为
+
+辅助函数同时返回罚值和对输入 $g$ 的导数：
+
+```cpp
+if (!(value > 0.0))
+    return {0.0, 0.0};
+return {value * value, 2.0 * value};
+```
+
+其分段形式为：
+
+$$
+P(g)=
+\begin{cases}
+0,&g\le0,\\
+g^2,&g>0.
+\end{cases}
+$$
+
+所以满足软阈值时罚值和梯度都为零，越界后按违反量平方增长。在 $g=0$ 处函数值
+和一阶导数连续，但二阶导数不连续。该一阶连续性使 L-BFGS 在刚接触软阈值时
+不会遇到普通 $[g]_+$ 的梯度跳变，并让大越界比小越界受到更强惩罚。
+
+### B.15 `integrateActuatorPenalty()` 逐步说明
+
+这是阶段 B 最核心的新增函数，可以按以下顺序阅读。
+
+#### B.15.1 从转速阈值转换为推力阈值
+
+函数从 `flatness.parameters()` 读取和开环映射相同的 $c_T$、转速范围与舵角
+范围，然后计算：
+
+```cpp
+thrust_min        = c_T * omega_min^2
+planning_omega_max = margin * omega_max
+thrust_max        = c_T * planning_omega_max^2
+flap_max          = margin * delta_max
+```
+
+注意 margin 必须在转速平方之前使用：
+
+$$
+T_{\max}^{\mathrm{plan}}
+=c_T(m\omega_{\max})^2
+=m^2c_T\omega_{\max}^2.
+$$
+
+如果错误地把物理最大推力直接乘 $m$，得到的等效转速裕量会是 $\sqrt m$，与
+命令行参数的含义不一致。
+
+`thrust_scale=max(1e-9, thrust_max-thrust_min)` 防止极端错误参数导致归一化分母
+为零。正常 paper 参数下该保护下界不会参与计算。
+
+#### B.15.2 分段积分循环
+
+外层循环遍历 `trajectory.durations()`，并维护当前段起始绝对时间
+`segment_start`。内层循环从 `0` 到 `samples_per_segment`，所以同时包含左右
+端点。步长和梯形权重分别为：
+
+```cpp
+step = duration / samples_per_segment
+weight = step * (endpoint ? 0.5 : 1.0)
+```
+
+只求目标值时，每个样本调用：
+
+```cpp
+sample = trajectory.sample(time)
+prediction = flatness.forward(sample, branch)
+```
+
+NLopt 请求梯度时则调用：
+
+```cpp
+linearization = flatness.linearize(sample, branch)
+prediction = linearization.prediction
+```
+
+因此执行器罚函数始终基于重新构造的候选样条及其解析导数，而不是对阶段 A
+CSV 做时间或空间插值。
+
+#### B.15.3 姿态分支状态为何必须跨样本保留
+
+`TailsitterFlatness::forward()` 可能存在多个等价姿态分支。`BranchState branch`
+在整个积分函数开始时创建一次，而不是每个样本或每段重置。只要候选四元数
+有限且范数合理，就把它写回 branch：
+
+```cpp
+branch.initialized = true;
+branch.attitude = prediction.attitude;
+```
+
+这样下一个采样点会优先选择与前一点最近的姿态分支，减少目标函数因任意
+$180^\circ$ 分支跳转产生的不连续。即使后续因单电机负推力等原因使
+`prediction.valid=false`，只要姿态本身已经成功求出，仍可延续该姿态分支。
+
+#### B.15.4 推力罚函数 lambda
+
+局部 `thrust_penalty` 同时检查下界和上界。若推力不是有限数，直接返回
+`invalid_mapping_penalty`；否则计算 B.4 节的两个平方铰链项。之后分别乘当前
+梯形权重并累加到 `integral.thrust_1/2`。
+
+直接约束推力而不是转速有两个好处：
+
+1. 负单电机推力可以直接产生下界违反量；
+2. 避免 $\omega=\sqrt{T/c_T}$ 在 $T\to0^+$ 附近的病态导数。
+
+越界时同时得到 $\partial p_{T_i}/\partial T_i$，与执行器雅可比相乘后进入
+15 维平坦输出导数梯度。
+
+#### B.15.5 舵面罚函数 lambda
+
+舵面使用 `abs(flap)`，因此一个表达式同时覆盖正负偏角限制。非有限舵角同样
+返回 `invalid_mapping_penalty`，有效舵角则计算超过 `flap_max` 的归一化平方
+违反量。
+
+越界时 `sign(flap)` 给出绝对值的局部导数；因为真正参与求导的区域满足
+$|\delta_i|>\delta_{\max}^{\mathrm{plan}}>0$，不会在零点使用不确定的符号导数。
+
+#### B.15.6 `invalid_mapping` 项
+
+只要 `prediction.valid` 为 false，还会额外累加：
+
+```cpp
+weight * invalid_mapping_penalty
+```
+
+如果无效预测同时留下 NaN 舵角，那么该采样会在 `flap_1`、`flap_2` 和
+`invalid_mapping` 三项中都受到惩罚。这是有意设置的高代价屏障：普通幅值越界
+只产生连续平方罚值，平坦映射根本不可求则应比小幅越界更不受欢迎。五个分量
+分开保留也能让日志明确指出代价来自公式失效，而不是正常幅值超限。
+
+### B.16 `evaluate()`：一次候选轨迹的完整求值与求导
+
+`evaluate()` 的执行顺序与目标函数数据流一一对应：
+
+1. 从变量向量解码分段时间；
+2. 从变量向量解码辅助位置点；
+3. 调用 `FlatOutputTrajectory::update()` 重建两套共享时间的样条；
+4. 计算位置 Snap 与 yaw 加速度组合能量；
+5. 除以固定的参考平滑能量；
+6. 只对变量向量中辅助点部分求平方和；
+7. 调用 `integrateActuatorPenalty()`；
+8. 按三个权重组装标量 `terms.total`；
+9. 如果 NLopt 请求梯度，取得平滑能量梯度并传播执行器罚函数的系数/时间偏导；
+10. 通过 softmax 时间映射和辅助点缩放映射组装优化变量梯度。
+
+几何项循环从 `tau_count` 开始，所以时间 logits 不会误计入辅助点偏移代价：
+
+```cpp
+for (i = tau_count; i < variables.size(); ++i)
+    geometry += variables[i] * variables[i];
+```
+
+函数用 `try/catch` 包住整个候选构造过程。非正分段时间、样条维度错误或其他
+异常不会逃出 NLopt 回调，而是统一返回 $10^{30}$。最终若加权目标成为 NaN 或
+Inf，也替换成 $10^{30}$。这相当于为数值上不可构造的候选建立一个有限但极大的
+外部屏障。
+
+这里捕获异常是为了保护优化迭代，不表示错误被静默忽略：正式调用之前的配置
+和维度错误由 `validateInputs()` 明确抛出；只有优化过程中个别候选失败才被转换
+为大目标值。
+
+### B.17 `ObjectiveContext` 与 NLopt 回调
+
+NLopt C++ 接口要求 C 风格的 `void*` 用户数据。`ObjectiveContext` 保存：
+
+```text
+固定总时间
+参考平滑能量
+名义位置/yaw 矩阵指针
+辅助点行号指针
+平坦映射和配置指针
+评估计数器
+```
+
+这些指针都指向 `optimize()` 调用期间仍然存活的对象，NLopt 返回前不会悬空。
+使用指针而不是每次复制 Eigen 矩阵，可以减少数百次目标评估中的固定数据开销。
+
+回调 `objective()` 先递增 `evaluations`。若 NLopt 传入非空梯度向量，就把它
+交给 `evaluate()` 填写；否则只求目标值。这样同一个求值函数同时服务于
+`LD_LBFGS`、初末目标报告和中心有限差分验证，不存在两套目标公式漂移的问题。
+
+### B.18 `validateInputs()` 的所有拒绝条件
+
+进入 NLopt 前会检查：
+
+- `total_time > 0`；
+- 至少两个位置航点；
+- 位置与 yaw 航点行数相同；
+- 分段时间数量恰好等于航点数减一；
+- 初始分段时间之和在相对 `1e-9` 容差内等于固定总时间；
+- 四类权重非负；
+- `actuator_margin` 位于 `(0,1]`；
+- 每段积分区间数、无效映射罚值、tau 边界、最大评估数和容差均为正；
+- 辅助点逐轴半范围非负；
+- 每个辅助点行号都是内部航点，不能是首末端；
+- 辅助点行号不能重复。
+
+首末端禁止成为辅助点是额外的结构保护。中间关键点是否固定则由调用者决定：
+应用程序只传 `{2}`，所以第 1 行关键点不可能被优化器移动。
+
+### B.19 `ActuatorPenaltyOptimizer::optimize()` 逐步说明
+
+#### B.19.1 构造参考轨迹
+
+函数先用传入的阶段 A 分段时间和名义航点构造 `reference`，并计算：
+
+```cpp
+smoothness_reference = max(1e-12, reference.energy(yaw_weight))
+```
+
+`1e-12` 保护完全静止或特殊零能量轨迹，避免后续归一化除零。参考值在整个
+阶段 B 优化期间固定，不会随候选轨迹更新；否则优化器可以通过同时改变分子和
+分母破坏目标的比较意义。
+
+#### B.19.2 构造初始变量和边界
+
+变量向量先全部置零，因此辅助点从名义位置开始。时间变量用阶段 A 分段时间
+相对最后一段的对数比覆盖。边界向量先全部设为 `[-1,1]`，再把前
+`tau_count` 项改写成 `[-tau_bound,+tau_bound]`。
+
+这种先统一初始化、再覆盖时间部分的写法使多个辅助点时仍保持同一布局，不需要
+为每个变量单独调用 NLopt 边界接口。
+
+#### B.19.3 保存初值目标
+
+调用 NLopt 前先执行一次 `evaluate()` 写入 `result.initial_terms`。这次求值不
+计入 `context.evaluations`，因为计数器定义为“NLopt 实际请求了多少次目标”。
+控制台因此可以同时报告清晰的初值和纯求解器调用次数。
+
+#### B.19.4 配置 `LD_LBFGS`
+
+求解器设置包括：
+
+```cpp
+set_min_objective(...)
+set_lower_bounds(...)
+set_upper_bounds(...)
+set_ftol_rel(relative_tolerance)
+set_xtol_rel(relative_tolerance)
+set_maxeval(max_evaluations)
+```
+
+`LD_LBFGS` 使用当前回调提供的完整一阶梯度。`ftol_rel` 检查目标相对变化，
+`xtol_rel` 检查变量相对变化，`maxeval` 则提供确定的最坏评估预算。它仍是局部
+优化器，当前结果依赖阶段 A 初值和所选姿态分支，不宣称找到全局最优轨迹。
+
+NLopt 正常返回后设置 `optimized=true`。异常会被包装成带
+`NLopt stage B optimization failed` 前缀的 `runtime_error`，保留原始原因供
+应用层统一打印。
+
+#### B.19.5 解码最终结果
+
+求解结束后再次调用相同的两个解码函数得到物理分段时间和位置矩阵，并重新
+调用 `evaluate()` 得到 `final_terms`。没有直接相信 NLopt 返回的 `minimum`
+作为最终分解，因为 `minimum` 只有总标量，无法提供五个积分分量和几何项。
+
+### B.20 `generate_stage_b_trajectory.cpp` 应用层说明
+
+阶段 B 应用程序负责实验定义、参数解析、基线构造、最终认证和文件输出，不把
+这些职责塞进通用优化器。
+
+#### B.20.1 命令行解析辅助函数
+
+`parseDouble()` 使用 `std::stod` 并额外拒绝 NaN/Inf；`parseInt()` 使用
+`std::stoi`。缺失参数值由局部 `next()` lambda 发现。未知选项打印完整 usage
+并返回状态码 2，数值或运行异常由最外层 catch 打印并返回状态码 1。
+
+具体范围不在解析层重复判断，而由 `ActuatorPenaltyOptimizer::validateInputs()`
+集中检查。例如 `--actuator-margin 1.2` 能被解析成 double，但会在优化前得到
+明确的配置错误。
+
+#### B.20.2 航点矩阵为何有四行
+
+应用程序按以下顺序构造位置：
+
+```text
+row 0: 固定起点       [0.00, 0, -10]
+row 1: 固定关键点     [1.50, 0, -10]
+row 2: 自由辅助点     [3.75, 0, -10]
+row 3: 固定终点       [6.00, 0, -10]
+```
+
+调用 `optimizer.optimize(...,{2})` 是“只有第 2 行可动”的唯一授权来源。控制台
+同时打印第 1 行优化前后值，便于直接确认中间关键点没有被误移动。
+
+#### B.20.3 阶段 A baseline 的构造
+
+应用层先调用：
+
+```cpp
+FixedTotalTimeAllocator(yaw_weight).optimize(
+    total_time, nominal_positions, yaws)
+```
+
+得到只考虑平滑能量的分段时间。随后：
+
+- baseline 用这些时间和名义辅助点构造；
+- 阶段 B 把这些时间作为初值，并允许第 2 行辅助点移动。
+
+因此两份 CSV 具有相同总时间、关键点、车辆参数和最终检查分辨率。区别只在于
+阶段 B 增加了执行器罚函数和辅助点自由度。
+
+#### B.20.4 参数模型选择
+
+默认使用 `VehicleParameters::paperVehicle()`；指定 `--simulation-vehicle` 后，
+优化积分和最终检查会同时改用 `simulationVehicle()`。不会出现“用 paper 参数
+优化、用 simulation 参数检查”的混合口径。
+
+#### B.20.5 最终稠密检查
+
+阶段 A/B 轨迹优化完成后分别调用：
+
+```cpp
+FeasibilityChecker(TailsitterFlatness(parameters), 0.002)
+checker.check(trajectory, true)
+```
+
+这里不再使用 `actuator_margin=0.75`，而是 `FeasibilityChecker` 默认的物理幅值
+margin `1.0`。`keep_predictions=true` 使报告保留所有开环输出，供 CSV 写出。
+
+程序不会因软罚函数仍有残余值而拒绝输出，也不会自动延长时间。这符合用户要求
+的“不重新进行时间缩放”。物理检查是否通过由
+`baseline feasible at physical limits` 和 `stage B feasible at physical limits`
+明确报告。
+
+#### B.20.6 `writeCsv()`
+
+CSV 字段与阶段 A 完全一致，因此原绘图脚本无需阶段 B 专用解析器。函数遍历
+稠密报告中的时间戳，在相同时间重新采样轨迹导数，再和报告中已经计算好的执行
+器预测拼成一行。
+
+这种写法保证位置/Snap 与执行器数据共享同一个时间索引。输出目录不存在时用
+`create_directories()` 创建，文件打开失败则抛出异常，不会静默生成空文件。
+
+#### B.20.7 控制台输出如何阅读
+
+程序依次打印：
+
+1. 固定总时间、yaw 工况和软罚参数；
+2. NLopt 评估次数；
+3. 阶段 A/B 三段时间；
+4. 固定关键点和辅助点优化前后坐标；
+5. 初始/最终组合目标及五个积分分量；
+6. 两条轨迹在真实物理限制下的峰值与可行性；
+7. 两份 CSV 的绝对路径。
+
+如果组合目标下降但某一个峰值略升，不构成程序矛盾：优化目标是违反量的时间
+积分，不是最大值；此外还同时权衡平滑与几何项。最终峰值必须结合稠密报告判断。
+
+### B.21 `test_stage_b.cpp` 逐项保证什么
+
+回归测试使用更低的 `20` 个积分区间/段和 `160` 次最大评估，以缩短 CTest
+时间，但保留与应用相同的 yaw `0 -> pi`、关键点、辅助点和车辆模型。测试检查：
+
+1. 求解器确实运行且至少发生一次目标评估；
+2. 最终三段时间之和仍为 `1.8 s`；
+3. 第 0、1、3 行三个关键点完全未移动；
+4. 最终组合目标没有高于初始目标；
+5. 执行器采样积分严格低于初值；
+6. 最终平滑能量和执行器积分有限；
+7. 重建轨迹的首末位置仍等于固定端点；
+8. 固定姿态分支下 $4\times15$ 执行器雅可比通过中心有限差分检查；
+9. yaw `0 -> 0` 和 `0 -> pi` 两个初始点的完整五维目标梯度均通过中心有限
+   差分检查；前者还会激活舵面软约束。
+
+当前完整目标梯度回归阈值为 $5\times10^{-4}$；两个工况中的最大缩放分量误差
+为 $3.35\times10^{-7}$。这个测试同时覆盖样条系数传播、显式时间偏导、固定
+总时间 softmax 和辅助点缩放链式法则。
+
+测试没有宣称证明连续时间硬约束，也没有强制每个执行器峰值都下降。那些性质
+需要 `FeasibilityChecker` 稠密检查和实验结果表来评估。
+
+### B.22 CMake 与绘图脚本的配套改动
+
+`CMakeLists.txt` 将 `src/actuator_penalty_optimizer.cpp` 加入
+`tailsitter_planning`，因此应用和测试共享同一实现；同时新增：
+
+```text
+generate_stage_b_trajectory
+test_stage_b
+CTest test name: stage_b
+```
+
+绘图脚本本身不理解阶段 A/B 算法，只比较相同 CSV schema。为适配当前无界面
+环境，本次还做了两个兼容修改：
+
+- 未指定 `--show` 时默认选择 Matplotlib `Agg` 后端，避免不可用的
+  `DISPLAY=:0` 触发 Tk 错误；
+- 仅当 3D axis 提供 `set_box_aspect()` 时才调用，使 Ubuntu/ROS 常见的旧版
+  Matplotlib 也能生成图片；
+- 允许四个执行器预测列在平坦映射无效时包含 NaN，并把这些区间画成断点；
+  轨迹状态列仍严格要求有限，峰值只统计有限执行器样本，同时打印无效样本数。
+  这样既能画出不可行工况，又不会用跨越 NaN 的连线伪造有效执行器输出。
+
+这两个修改只影响绘图运行环境，不改变任何轨迹或优化数值。
+
+### B.23 推荐的调参和诊断顺序
+
+阶段 B 出现不理想结果时，建议按以下顺序处理：
+
+1. 先保持 `actuator_weight=200`，提高 `samples_per_segment` 检查是否是采样过粗；
+2. 查看五个积分分量，确认主要违反来自电机、舵面还是无效映射；
+3. 若小幅软越界不能接受，先把 `actuator_weight` 增大到 `500～1000`；
+4. 若辅助点移动过多，提高 `geometry_weight` 或缩小
+   `auxiliary_half_range`；
+5. 若目标停在不同局部解，提高 `maxeval`，并尝试多个辅助点名义初值；
+6. 若 `invalid_mapping` 非零，优先检查负推力、姿态分支和舵面分配奇异性，
+   不要只继续增大普通幅值罚权；
+7. 最后始终以更密的 `FeasibilityChecker` 和闭环仿真复核。
+
+把 `actuator_margin` 从 `0.75` 改为 `1.0` 表示只在真实物理幅值之外开始惩罚，
+而不是取消执行器罚函数。反过来，减小 margin 是预留模型误差裕度，但也会加大
+平滑性和几何偏移的牺牲。
 
 ---
 
@@ -2399,8 +3352,8 @@ $$
 \mathcal J_2[ab]
 =
 \left(
-ab,\ 
-\dot a\,b+a\,\dot b,\ 
+ab,\quad
+\dot a\,b+a\,\dot b,\quad
 \ddot a\,b+2\dot a\dot b+a\,\ddot b
 \right).
 $$
@@ -2420,8 +3373,8 @@ $$
 \mathcal J_2[x^{-1}]
 =
 \left(
-\frac1x,\ 
--\frac{\dot x}{x^2},\ 
+\frac1x,\quad
+-\frac{\dot x}{x^2},\quad
 \frac{2\dot x^2}{x^3}-\frac{\ddot x}{x^2}
 \right).
 $$
@@ -2456,8 +3409,8 @@ $$
 \mathcal J_2[\sin x]
 =
 \left(
-\sin x,\ 
-\cos x\,\dot x,\ 
+\sin x,\quad
+\cos x\,\dot x,\quad
 \cos x\,\ddot x-\sin x\,\dot x^2
 \right),
 $$
@@ -2466,8 +3419,8 @@ $$
 \mathcal J_2[\cos x]
 =
 \left(
-\cos x,\ 
--\sin x\,\dot x,\ 
+\cos x,\quad
+-\sin x\,\dot x,\quad
 -\sin x\,\ddot x-\cos x\,\dot x^2
 \right).
 $$
@@ -3252,8 +4205,9 @@ $$
 }.
 $$
 
-Crackle 和 yaw Jerk 只有在继续计算力矩变化率、执行器速率前馈或更高阶
-动态时才会需要。
+Crackle 和 yaw Jerk 不参与当前时刻的执行器**值**恢复；阶段 B 对分段时间求导
+时，移动积分节点需要它们组成 $\dot{\boldsymbol\xi}$。如果以后继续计算力矩
+变化率、执行器速率前馈或更高阶动态，也会再次需要这两项。
 
 ### 15.20 <code>Jet2</code> 的数值边界与阅读要点
 
@@ -3265,8 +4219,9 @@ Crackle 和 yaw Jerk 只有在继续计算力矩变化率、执行器速率前�
   导数的物理解释；
 - 四元数只用于选择离散姿态分支，姿态导数来自连续的 roll、pitch、yaw jet，
   不是对四元数做有限差分；
-- <code>Jet2</code> 只传播时间导数。若要优化车辆参数、航点或执行器罚函数，
-  仍需另外使用第 14.16 节的参数梯度、自动微分或伴随方法；
+- <code>Jet2</code> 本身只传播时间导数。阶段 B 另外使用
+  <code>DifferentiableJet2&lt;ADScalar&gt;</code> 和第 14.16 节的样条参数梯度，
+  把固定分支执行器罚函数传播到航点与分段时间，详见第 17 章；
 - 当前只保留推力 jet 的值。如果以后加入电机转速变化率约束，可以继续使用
   已经计算出的 $\dot T$，但还需谨慎处理 $T_i$ 的差分力矩导数。
 
@@ -3289,3 +4244,3304 @@ Crackle 和 yaw Jerk 只有在继续计算力矩变化率、执行器速率前�
 掌握这张对应表后，<code>forward()</code> 中看似复杂的嵌套旋转和气动表达式
 可以统一理解为：先用普通物理公式写出“值”，再由 <code>Jet2</code> 的运算符
 自动、同步地携带该公式的一阶和二阶时间导数。
+
+## 16. 借鉴 `paper_manifold` 规划并使用 `paper_control` 闭环跟踪
+
+### 16.1 总体结论
+
+可以借鉴 `paper_manifold` 的轨迹优化框架，并使用 `paper_control` 的
+PD+INDI 控制器跟踪规划结果。这也是 `paper_planning` 和 `paper_control`
+原本设想的互补关系：前者生成满足标称动力学和执行器限制的参考轨迹，后者
+根据实时状态和惯性测量计算闭环执行器命令。
+
+但是，不能把 `paper_manifold` 的位置-only平坦输出、四旋翼尾座式动力学和
+仅针对总推力/机体角速度的约束原样移植到当前双电机、双舵面飞翼构型。正确的
+组合方式是：
+
+1. 复用 `paper_manifold` 的 MINCO、多项式参数化、时间优化、约束罚函数和
+   优化后稠密验证思想；
+2. 保留 `paper_planning` 针对当前构型推导的四维平坦输出和完整执行器映射；
+3. 继续由 `paper_control` 根据参考轨迹和当前状态计算实际闭环命令。
+
+### 16.2 三个层级的变量不能混为一组
+
+当前系统应同时保留三组变量，它们对应不同的模型边界，并不互相矛盾。
+
+| 层级 | 状态或输出 | 输入 | 用途 |
+| --- | --- | --- | --- |
+| 完整飞行器 | $\mathbf x_f=(\mathbf p,\mathbf v,\mathbf R,\boldsymbol\Omega)$ | $\mathbf u_a=(T_1,T_2,\delta_1,\delta_2)$ | 真实动力学、仿真和执行器可行性 |
+| 高层约化模型 | $\mathbf x_h=(\mathbf p,\mathbf v,\mathbf R)$ | $\mathbf u_h=(T,\boldsymbol\Omega)$ | 表达规划参考和高层运动能力 |
+| 平坦输出空间 | $\boldsymbol\sigma=(\mathbf p,\psi)$ | 不把输入设为独立决策变量 | 实际轨迹优化 |
+
+其中 $\boldsymbol\Omega$ 表示机体角速度，$\omega_1,\omega_2$ 表示两个电机的
+转速。两者必须在变量名和日志中保持区分。
+
+完整刚体模型中的 $\boldsymbol\Omega$ 是状态，力矩是其动力学输入；当内层角速度
+控制足够快时，可以把角速度动力学划到低层闭环中，于是
+$\boldsymbol\Omega_{\mathrm{cmd}}$ 可以作为高层约化模型的虚拟输入。因此可以采用
+
+$$
+\mathbf x_h=(\mathbf p,\mathbf v,\mathbf R),\qquad
+\mathbf u_h=(T,\boldsymbol\Omega),
+$$
+
+但它只是一套高层变量，不能取代用于最终可行性检查的双电机和双舵面输入。
+
+### 16.3 为什么不能照搬 `paper_manifold` 的位置-only平坦输出
+
+`paper_manifold` 施加协调飞行条件，利用零侧滑约束消去一个姿态自由度，因此
+只选择三维位置作为平坦输出。在该条件下，位置及其导数可以确定参考姿态和输入。
+
+当前构型和 `paper_control` 则明确支持：
+
+- 非协调和带侧滑飞行；
+- knife-edge flight；
+- 差分推力快速转向；
+- 独立指定 yaw 的滚转、倒飞和过渡机动。
+
+这些机动要求 yaw 保持为独立规划自由度。因此当前规划器必须继续使用
+
+$$
+\boxed{
+\boldsymbol\sigma(t)=
+\begin{bmatrix}
+\mathbf p(t)\\
+\psi(t)
+\end{bmatrix}
+}
+$$
+
+而不是仅优化 $\mathbf p(t)$。如果强制使用位置-only映射，就等价于重新引入某种
+协调飞行姿态选择规则，会失去 `paper_control` 最有价值的非协调机动能力。
+
+### 16.4 推荐的联合优化形式
+
+可以采用与 `paper_manifold` 相似的时空联合优化结构：
+
+$$
+\begin{aligned}
+\min_{\boldsymbol\sigma(t),T_f}\quad
+&\int_0^{T_f}\left(
+\|\mathbf p^{(4)}(t)\|^2
++\lambda_\psi\ddot\psi^2(t)
++\lambda_u P(\mathbf u_a(t))
+\right)dt+\rho T_f,\\
+\text{s.t.}\quad
+&\text{航点、边界导数、安全走廊、状态和输入约束。}
+\end{aligned}
+$$
+
+优化变量仍然是位置/yaw样条的内部参数、辅助航点和分段时间。状态和输入不作为
+独立决策变量，而是通过当前构型的平坦映射逐级恢复：
+
+$$
+\begin{aligned}
+(\mathbf R,T)
+&=\mathcal F_2(\mathbf p,\dot{\mathbf p},\ddot{\mathbf p},\psi),\\
+\boldsymbol\Omega
+&=\mathcal F_3(\mathbf p^{(0:3)},\psi,\dot\psi),\\
+(\dot{\boldsymbol\Omega},\mathbf m,T_1,T_2,\delta_1,\delta_2)
+&=\mathcal F_4(\mathbf p^{(0:4)},\psi,\dot\psi,\ddot\psi).
+\end{aligned}
+$$
+
+这样，平移运动学、平移动力学、姿态运动学和转动动力学都通过平坦映射按构造
+满足，不需要在优化变量中再次对完整十二维动力学执行数值积分。
+
+### 16.5 高层约束与真实执行器约束应同时保留
+
+高层约化变量可以加入以下约束：
+
+$$
+\|\mathbf v\|\leq v_{\max},\qquad
+\|\boldsymbol\Omega\|\leq\Omega_{\max},\qquad
+T_{\min}\leq T\leq T_{\max}.
+$$
+
+这些约束限制参考轨迹的速度、姿态变化速度和总推力需求，适合作为快速、平滑的
+中间层筛选。但它们不能保证控制分配一定可行。例如，即使
+$\|\boldsymbol\Omega\|$ 很小，快速变化的角速度仍可能需要很大的
+$\dot{\boldsymbol\Omega}$ 和控制力矩。
+
+因此最终还必须使用 `paper_planning` 的完整开环映射约束：
+
+$$
+\begin{aligned}
+T_{i,\min}&\leq T_i\leq T_{i,\max},\\
+|\delta_i|&\leq\delta_{\max},\qquad i\in\{1,2\}.
+\end{aligned}
+$$
+
+在现有幅值约束之上，建议进一步加入：
+
+$$
+|\dot T_i|\leq\dot T_{\max},\qquad
+|\dot\delta_i|\leq\dot\delta_{\max},
+$$
+
+或显式加入电机和舵机的一阶动态。幅值可行并不代表执行器能够以所需速度变化，
+这正是第 12.4 节所述的当前缺口。
+
+因此，不应把当前单电机、单舵面约束降级为仅约束 $(T,\boldsymbol\Omega)$；推荐
+采用
+
+$$
+\boxed{
+(T,\boldsymbol\Omega)\text{ 高层约束}
++(T_1,T_2,\delta_1,\delta_2)\text{ 执行器约束}
+}.
+$$
+
+### 16.6 如何理解 `paper_planning` 的开环可行性
+
+`paper_planning` 的开环约束是标称轨迹规划的正常组成部分，并不意味着最终以
+开环方式飞行。它回答的问题是：是否存在一组不越界的理想执行器输入，使标称
+模型精确沿参考轨迹运动。
+
+`paper_manifold` 的规划约束本质上同样是开环、标称和模型驱动的；它在规划阶段
+检查参考总推力和机体角速度，并没有把闭环 MPC 和真实飞行器完整地嵌入轨迹
+优化。对于当前构型，`paper_planning` 从 Snap 和 yaw acceleration 继续计算
+$T_1,T_2,\delta_1,\delta_2$，实际上比只约束总推力和机体角速度更接近真实
+执行器边界。
+
+开环映射仍存在以下模型误差：
+
+- 忽略舵面直接力引起的轻微非最小相位效应；
+- 忽略部分自由来流和角速度相关力矩；
+- 未完整包含电机、ESC 和舵机动态；
+- 未包含估计延迟、传感器噪声、风和闭环控制瞬态。
+
+这些误差不应通过删除开环执行器约束来解决，而应通过执行器裕度、闭环验证和
+更高保真度评估逐步补偿。
+
+### 16.7 与 `paper_control` 的正确数据接口
+
+规划器预测得到的
+
+$$
+T_1^{\mathrm{ff}},T_2^{\mathrm{ff}},
+\delta_1^{\mathrm{ff}},\delta_2^{\mathrm{ff}}
+$$
+
+只用于可行性检查、代价计算和结果诊断，不应直接发送到当前仿真或真实执行器。
+保持 `paper_control` 原有闭环结构时，规划器应输出：
+
+$$
+\boxed{
+\mathbf p_{\mathrm{ref}},
+\mathbf v_{\mathrm{ref}},
+\mathbf a_{\mathrm{ref}},
+\mathbf j_{\mathrm{ref}},
+\psi_{\mathrm{ref}},
+\dot\psi_{\mathrm{ref}}
+}.
+$$
+
+`paper_control` 随后完成：
+
+1. 位置/速度 PD 产生线加速度命令；
+2. 线加速度 INDI 根据当前加速度和力估计求姿态、总推力命令；
+3. Jerk 和 yaw rate 通过平坦映射生成 $\boldsymbol\Omega_{\mathrm{ref}}$；
+4. 姿态/角速度 PD 产生角加速度命令；
+5. 角加速度 INDI 产生力矩命令；
+6. 在线控制分配器计算双电机和双舵面命令并执行限幅。
+
+规划阶段恢复出的 $\mathbf R,T,\boldsymbol\Omega$ 可以用于参考轨迹可视化、约束
+检查和闭环结果对比，但不应绕过 INDI 的传感器反馈修正。
+
+### 16.8 推荐的多保真可行性流程
+
+如果希望约束比单纯开环检查更接近实际闭环能力，推荐使用以下两级流程：
+
+```text
+位置/yaw 航点和边界条件
+        │
+        ▼
+MINCO/SplineTrajectory 优化 p、psi、辅助点和分段时间
+        │
+        ▼
+当前构型平坦映射
+        │
+        ├── 高层参考：R、T、机体角速度
+        └── 原始执行器预测：T1、T2、delta1、delta2
+        │
+        ▼
+带裕度的约束罚函数和高密度开环认证
+        │
+        ▼
+paper_control + 执行器动态的闭环仿真
+        │
+        ▼
+检查跟踪误差、饱和持续时间和最小执行器裕度
+        │
+        ▼
+失败时调整局部分段时间/辅助点并重新优化
+```
+
+第一层是可解析或可自动微分的快速内层优化；第二层是包含控制器、执行器动态、
+状态估计和扰动的高保真闭环评估。若暂时无法对闭环仿真求梯度，可以把以下指标
+作为低维外层黑盒目标：
+
+$$
+J_{\mathrm{closed}}=
+w_p\max_t\|\mathbf p_{\mathrm{ref}}-\mathbf p\|
++w_\psi\max_t|\psi_{\mathrm{ref}}-\psi|
++w_s t_{\mathrm{saturation}}.
+$$
+
+执行器软约束建议预留约 $10\%\sim25\%$ 的闭环裕度，但最终比例必须通过当前
+平台的闭环仿真或实验标定，而不能直接照搬其他论文的数值。
+
+### 16.9 对当前 `planning/` 实现的具体判断
+
+当前阶段 A/B 已经采用了正确的基本分层：
+
+- 位置使用七次 minimum-snap 样条；
+- yaw 使用三次 minimum-yaw-acceleration 样条；
+- 二者共享分段时间；
+- 通过独立 `paper_planning` 平坦映射得到未经限幅的执行器预测；
+- 阶段 B 已将执行器违反量作为采样积分罚函数；
+- 最后通过更密的采样执行开环可行性检查。
+
+因此不应把现有执行器约束替换成 `paper_manifold` 的
+$(T,\boldsymbol\Omega)$ 约束，而应按以下顺序增强。当前进度为：
+
+1. **已完成**：在现有执行器约束之外加入机体角速度高层约束；
+2. **已完成**：加入电机/舵机一阶执行器动态和舵面角速度约束；
+3. 把规划 CSV/样条接口接入当前 `paper_control` 闭环仿真；
+4. 记录闭环跟踪误差、实际饱和量、饱和持续时间和控制裕度；
+5. 使用闭环结果标定 `actuator_margin`，必要时构造外层黑盒时间/航点优化；
+6. 最终保留“开环平坦映射认证 + 闭环仿真认证”两道检查。
+
+最终推荐架构可概括为：
+
+$$
+\boxed{
+\text{借鉴 paper\_manifold 的优化框架}
++\text{保留 paper\_planning 的构型平坦映射与执行器约束}
++\text{使用 paper\_control 执行闭环跟踪}
+}.
+$$
+
+---
+
+## 17. Stage B 执行器约束梯度与 L-BFGS
+
+本章记录执行器约束梯度按照“局部映射、罚函数、样条、优化变量、验证、求解器”
+的顺序完成后的实现。最终结果不是对四个执行器做数值差分，而是在有效姿态分支
+内得到解析/自动微分梯度，并只用有限差分做独立回归验证。
+
+### 17.1 第一步：固定姿态分支的执行器雅可比
+
+#### 17.1.1 单点输入、输出和 Jacobian 的列顺序
+
+单点平坦映射的独立变量按代码中的固定顺序组成 15 维向量：
+
+$$
+\boldsymbol\xi=
+\begin{bmatrix}
+\mathbf v^\top&\mathbf a^\top&\mathbf j^\top&\mathbf s^\top&
+\psi&\dot\psi&\ddot\psi
+\end{bmatrix}^\top.
+$$
+
+其中 $\mathbf s=\mathbf p^{(4)}$ 是 Snap。位置 $\mathbf p$ 本身没有出现在
+$\boldsymbol\xi$ 中，因为当前无风、空间均匀的开环模型具有平移不变性：把整条
+轨迹平移一个常向量不会改变姿态、力矩或执行器输入。
+
+执行器输出选择为
+
+$$
+\mathbf u_a=
+\begin{bmatrix}T_1&T_2&\delta_1&\delta_2\end{bmatrix}^\top,
+$$
+
+因此 `ActuatorLinearization` 保存
+
+$$
+\boxed{
+\mathbf J_{u\xi}=\frac{\partial\mathbf u_a}{\partial\boldsymbol\xi}
+\in\mathbb R^{4\times15}
+}.
+$$
+
+矩阵的第 $r$ 行是第 $r$ 个执行器对 15 个平坦变量的偏导，第 $c$ 列是四个
+执行器对第 $c$ 个平坦变量的偏导。对任意小扰动
+$\mathrm d\boldsymbol\xi$，一阶近似为
+
+$$
+\boxed{
+\mathrm d\mathbf u_a
+=\mathbf J_{u\xi}\,\mathrm d\boldsymbol\xi
+}.
+$$
+
+这里对单电机推力而不是转速求导。转速满足
+$\omega_i=\sqrt{T_i/c_T}$，若一定需要转速梯度，则在 $T_i>0$ 时可由
+
+$$
+\frac{\partial\omega_i}{\partial\boldsymbol\xi}
+=\frac{1}{2\sqrt{c_TT_i}}
+\frac{\partial T_i}{\partial\boldsymbol\xi}
+$$
+
+得到。但该系数在 $T_i\rightarrow0^+$ 时发散；直接对推力施加由转速范围换算
+得到的等价边界，可以避免把这个病态因子带进优化器。
+
+#### 17.1.2 为什么必须先固定姿态分支
+
+令 roll/pitch 分支编号为
+
+$$
+\mathbf b=(b_\phi,b_\theta),\qquad b_\phi,b_\theta\in\{0,1\}.
+$$
+
+对固定 $\mathbf b$，连续平坦映射可以写成
+
+$$
+\mathbf u_a=\mathcal F_{\mathbf b}(\boldsymbol\xi).
+$$
+
+实际 `forward()` 还要枚举候选、删除负总推力候选，并通过四元数距离
+
+$$
+b^*(\boldsymbol\xi)
+=\arg\min_{\mathbf b}\left(1-|q_{\mathrm{prev}}^Tq_{\mathbf b}|\right)
+$$
+
+选择与上一采样姿态连续的分支。完整映射
+$\mathcal F_{b^*(\boldsymbol\xi)}(\boldsymbol\xi)$ 只在分支不变的邻域内光滑；
+`argmin` 切换面上不存在普通意义下的唯一导数。
+
+因此 `linearize()` 采用以下定义：先用普通 `forward()` 得到标称分支
+$\mathbf b^*$，再计算
+
+$$
+\boxed{
+\mathbf J_{u\xi}
+=\left.
+\frac{\partial\mathcal F_{\mathbf b}(\boldsymbol\xi)}
+{\partial\boldsymbol\xi}
+\right|_{\mathbf b=\mathbf b^*}
+}.
+$$
+
+这不是忽略一个本来存在的连续导数，而是在分段光滑问题中明确选择当前光滑片
+的 Jacobian。有限差分测试也固定上一姿态，并拒绝扰动后发生分支变化的样本，
+保证比较的是同一个数学对象。
+
+#### 17.1.3 外层参数微分与内层时间 Jet
+
+原来的 `Jet2` 保存
+
+$$
+\mathcal J_2[x]=(x,\dot x,\ddot x),
+$$
+
+用于沿物理时间恢复 $\dot\phi,\ddot\phi,\boldsymbol\Omega$ 和
+$\dot{\boldsymbol\Omega}$。它不是优化变量梯度。新增实现把每个 Jet 分量的标量
+类型换成固定长度 AutoDiff 标量：
+
+$$
+\widehat x=(x,\nabla_{\boldsymbol\xi}x),
+$$
+
+$$
+\mathcal J_2[\widehat x]
+=(\widehat x,\widehat{\dot x},\widehat{\ddot x}).
+$$
+
+第 $l$ 个独立变量的种子是
+
+$$
+\widehat\xi_l=(\xi_l,\mathbf e_l),
+$$
+
+其中 $\mathbf e_l\in\mathbb R^{15}$ 是第 $l$ 个标准基向量。这样一次前向计算后，
+每个输出标量已经携带完整的 15 维梯度。
+
+外层微分使用普通全微分规则，例如
+
+$$
+\begin{aligned}
+\mathrm d(xy)&=y\,\mathrm dx+x\,\mathrm dy,\\
+\mathrm d(1/x)&=-\frac{\mathrm dx}{x^2},\\
+\mathrm d(\sin x)&=\cos x\,\mathrm dx,\\
+\mathrm d(\cos x)&=-\sin x\,\mathrm dx,\\
+\mathrm d\sqrt{x}&=\frac{\mathrm dx}{2\sqrt{x}},\\
+\mathrm d\operatorname{atan2}(y,x)
+&=\frac{x\,\mathrm dy-y\,\mathrm dx}{x^2+y^2}.
+\end{aligned}
+$$
+
+对旋转后的向量则有
+
+$$
+\mathrm d\!\left(R(\gamma)\mathbf z\right)
+=R(\gamma)\,\mathrm d\mathbf z
++\frac{\partial R}{\partial\gamma}\mathbf z\,\mathrm d\gamma.
+$$
+
+`DifferentiableJet2<ADScalar>` 同时执行内层时间导数乘法规则和上述外层参数链式
+法则，所以不需要手写包含二阶时间导数的巨大 $4\times15$ 展开式。
+
+#### 17.1.4 从平坦变量到姿态和总推力的局部微分
+
+固定分支后，输入 Jet 为
+
+$$
+\mathcal J_2[\mathbf v]=(\mathbf v,\mathbf a,\mathbf j),
+$$
+
+$$
+\mathcal J_2[\mathbf f]
+=\left(m(\mathbf a-g\mathbf e_z),m\mathbf j,m\mathbf s\right),
+\qquad
+\mathcal J_2[\psi]=(\psi,\dot\psi,\ddot\psi).
+$$
+
+对外层扰动，参考力首先满足
+
+$$
+\mathrm d\mathbf f=m\,\mathrm d\mathbf a,\qquad
+\mathrm d\dot{\mathbf f}=m\,\mathrm d\mathbf j,\qquad
+\mathrm d\ddot{\mathbf f}=m\,\mathrm d\mathbf s.
+$$
+
+令 $\mathbf f^\psi=R_z(\psi)\mathbf f$，则
+
+$$
+\mathrm d\mathbf f^\psi
+=R_z(\psi)\mathrm d\mathbf f
++R_z'(\psi)\mathbf f\,\mathrm d\psi.
+$$
+
+基本 roll 为 $\phi_0=-\operatorname{atan2}(f_y^\psi,f_z^\psi)$，所以
+
+$$
+\boxed{
+\mathrm d\phi
+=-\frac{
+f_z^\psi\,\mathrm df_y^\psi
+-f_y^\psi\,\mathrm df_z^\psi
+}{(f_y^\psi)^2+(f_z^\psi)^2}
+}.
+$$
+
+分支项 $b_\phi\pi$ 是常数，因此
+$\mathrm d(\phi_0+b_\phi\pi)=\mathrm d\phi_0$。正则化速度的微分为
+
+$$
+V_\epsilon=\sqrt{\mathbf v^T\mathbf v+\epsilon_v^2},\qquad
+\boxed{
+\mathrm dV_\epsilon=\frac{\mathbf v^T\mathrm d\mathbf v}{V_\epsilon}
+}.
+$$
+
+继续按第 15.11 节定义 $\sigma_y,\sigma_x$，则固定 pitch 分支满足
+
+$$
+\bar\theta=\operatorname{atan2}(\sigma_y,\sigma_x)+b_\theta\pi,
+$$
+
+$$
+\boxed{
+\mathrm d\bar\theta
+=\frac{
+\sigma_x\,\mathrm d\sigma_y
+-\sigma_y\,\mathrm d\sigma_x
+}{\sigma_x^2+\sigma_y^2}
+}.
+$$
+
+$\mathrm d\sigma_x$ 和 $\mathrm d\sigma_y$ 由乘积法则得到。例如
+
+$$
+\mathrm d(V_\epsilon v_x^\phi)
+=v_x^\phi\,\mathrm dV_\epsilon
++V_\epsilon\,\mathrm dv_x^\phi,
+$$
+
+而 $\mathrm d\mathbf v^\phi$ 同时包含
+$\mathrm d\mathbf v,\mathrm d\psi,\mathrm d\phi$ 三条路径。
+
+令总推力公式的分子为
+
+$$
+N_T=
+\cos\bar\theta f_x^\phi-
+\sin\bar\theta f_z^\phi+
+c_{D_V}V_\epsilon
+\left(\cos\bar\theta v_x^\phi-\sin\bar\theta v_z^\phi\right),
+$$
+
+分母 $d_\eta$ 只由固定车辆参数组成，因此
+
+$$
+\boxed{
+\mathrm dT=\frac{\mathrm dN_T}{d_\eta}
+}.
+$$
+
+例如其中第一项的微分为
+
+$$
+\mathrm d(\cos\bar\theta f_x^\phi)
+=-\sin\bar\theta f_x^\phi\,\mathrm d\bar\theta
++\cos\bar\theta\,\mathrm df_x^\phi,
+$$
+
+其余项完全由相同规则得到。实际代码没有遗漏这些交叉项，因为它们由 AutoDiff
+在固定分支连续表达式上统一生成。
+
+#### 17.1.5 从角速度、刚体力矩到双电机推力
+
+由第 15.13 节的 Euler 角速率关系，可写成
+
+$$
+\boldsymbol\Omega
+=\mathcal W(\phi,\theta,
+\dot\phi,\dot\theta,\dot\psi).
+$$
+
+因此
+
+$$
+\mathrm d\boldsymbol\Omega
+=\mathcal W_\phi\mathrm d\phi
++\mathcal W_\theta\mathrm d\theta
++\mathcal W_{\dot\phi}\mathrm d\dot\phi
++\mathcal W_{\dot\theta}\mathrm d\dot\theta
++\mathcal W_{\dot\psi}\mathrm d\dot\psi.
+$$
+
+$\mathrm d\dot{\boldsymbol\Omega}$ 同理由时间 Jet 的 `first` 分量自动得到。
+刚体力矩
+
+$$
+\mathbf M=I\dot{\boldsymbol\Omega}
++\boldsymbol\Omega\times(I\boldsymbol\Omega)
+$$
+
+的精确一阶微分为
+
+$$
+\boxed{
+\mathrm d\mathbf M
+=I\,\mathrm d\dot{\boldsymbol\Omega}
++\mathrm d\boldsymbol\Omega\times(I\boldsymbol\Omega)
++\boldsymbol\Omega\times(I\,\mathrm d\boldsymbol\Omega)
+}.
+$$
+
+差分推力分母 $d_{\Delta T}$ 也是固定车辆参数，所以
+
+$$
+\Delta T=\frac{M_z}{d_{\Delta T}},\qquad
+\mathrm d\Delta T=\frac{\mathrm dM_z}{d_{\Delta T}}.
+$$
+
+于是双电机推力的两行 Jacobian 来自
+
+$$
+\boxed{
+\mathrm dT_1=\frac12(\mathrm dT+\mathrm d\Delta T),\qquad
+\mathrm dT_2=\frac12(\mathrm dT-\mathrm d\Delta T)
+}.
+$$
+
+#### 17.1.6 舵面分配的矩阵微分
+
+剩余舵面力矩为
+
+$$
+\mathbf M_\delta=\mathbf M-\mathbf M_T-\mathbf M_\mu,
+$$
+
+所以
+
+$$
+\mathrm d\mathbf M_\delta
+=\mathrm d\mathbf M-\mathrm d\mathbf M_T-\mathrm d\mathbf M_\mu.
+$$
+
+对 $V=\|\mathbf v\|>0$，未正则化速度模和机体系速度的微分为
+
+$$
+\mathrm dV=\frac{\mathbf v^T\mathrm d\mathbf v}{V},
+$$
+
+$$
+\mathrm d\mathbf v^b
+=R_i^b\mathrm d\mathbf v+(\mathrm dR_i^b)\mathbf v.
+$$
+
+因此
+
+$$
+\mathrm dv_x^\alpha
+=\cos\alpha_0\,\mathrm dv_x^b
++\sin\alpha_0\,\mathrm dv_z^b,
+$$
+
+$$
+\boxed{
+\mathrm d\nu_i
+=-c_{L_T}^{\delta}\cos\bar\alpha\,\mathrm dT_i
+-c_{L_V}^{\delta}
+\left(v_x^\alpha\mathrm dV+V\mathrm dv_x^\alpha\right)
+}.
+$$
+
+分配矩阵 $A_\delta$ 的每个元素都与 $\nu_1$ 或 $\nu_2$ 线性相关，因此
+$\mathrm dA_\delta$ 可直接由 $\mathrm d\nu_i$ 得到。记
+
+$$
+\boldsymbol\delta=
+\begin{bmatrix}\delta_1&\delta_2\end{bmatrix}^\top,\qquad
+\mathbf m_\delta=
+\begin{bmatrix}M_{\delta x}&M_{\delta y}\end{bmatrix}^\top,
+$$
+
+原分配方程为
+
+$$
+A_\delta\boldsymbol\delta=\mathbf m_\delta.
+$$
+
+两边微分：
+
+$$
+(\mathrm dA_\delta)\boldsymbol\delta
++A_\delta\mathrm d\boldsymbol\delta
+=\mathrm d\mathbf m_\delta.
+$$
+
+因此舵面 Jacobian 最关键的公式是
+
+$$
+\boxed{
+\mathrm d\boldsymbol\delta
+=A_\delta^{-1}
+\left[
+\mathrm d\mathbf m_\delta
+-(\mathrm dA_\delta)\boldsymbol\delta
+\right]
+}.
+$$
+
+它说明舵角梯度包含两部分：剩余目标力矩的变化，以及气动效率/分配矩阵本身的
+变化。只对右端力矩求导而把 $A_\delta$ 当常数，会漏掉第二部分。当前显式
+$2\times2$ 逆矩阵在 AutoDiff 标量上运算，因此两部分都会进入
+$\partial\delta_i/\partial\boldsymbol\xi$。当 $V=0$ 时普通速度模不可微，代码
+选择零子梯度；当分配行列式接近零或标称映射无效时，不返回可微 Jacobian。
+
+### 17.2 第二步：从执行器雅可比得到罚函数梯度
+
+#### 17.2.1 平方铰链的导数
+
+定义
+
+$$
+[g]_+=\max(0,g),\qquad P(g)=[g]_+^2.
+$$
+
+则
+
+$$
+P'(g)=
+\begin{cases}
+0,&g\le0,\\
+2g,&g>0.
+\end{cases}
+$$
+
+在 $g=0$ 处左右一阶导数都为 0，所以 $P$ 是 $C^1$ 但不是 $C^2$。L-BFGS 只
+使用一阶梯度，因此软阈值本身不会产生梯度跳变。
+
+#### 17.2.2 单电机推力罚函数
+
+为避免与差分推力 $\Delta T$ 混淆，记推力允许区间宽度为
+
+$$
+S_T=T_{\max}^{\mathrm{plan}}-T_{\min}>0.
+$$
+
+对第 $i$ 个电机定义
+
+$$
+g_{i,L}=\frac{T_{\min}-T_i}{S_T},\qquad
+g_{i,U}=\frac{T_i-T_{\max}^{\mathrm{plan}}}{S_T},
+$$
+
+$$
+p_{T_i}=P(g_{i,L})+P(g_{i,U}).
+$$
+
+由于
+
+$$
+\frac{\partial g_{i,L}}{\partial T_i}=-\frac1{S_T},\qquad
+\frac{\partial g_{i,U}}{\partial T_i}=\frac1{S_T},
+$$
+
+得到代码中 `thrust_penalty.derivative` 对应的显式公式
+
+$$
+\boxed{
+\frac{\partial p_{T_i}}{\partial T_i}
+=-\frac{2[g_{i,L}]_+}{S_T}
++\frac{2[g_{i,U}]_+}{S_T}
+}.
+$$
+
+因此低于下限时梯度为负，梯度下降会增大 $T_i$；高于上限时梯度为正，梯度下降
+会减小 $T_i$，方向与物理直觉一致。
+
+#### 17.2.3 单舵面罚函数
+
+记 $\delta_p=\delta_{\max}^{\mathrm{plan}}>0$，定义
+
+$$
+g_{\delta_i}=\frac{|\delta_i|-\delta_p}{\delta_p},\qquad
+p_{\delta_i}=P(g_{\delta_i}).
+$$
+
+在真正越界的区域 $|\delta_i|>\delta_p$ 内必有 $\delta_i\ne0$，所以
+
+$$
+\boxed{
+\frac{\partial p_{\delta_i}}{\partial\delta_i}
+=\frac{2[g_{\delta_i}]_+}{\delta_p}
+\operatorname{sign}(\delta_i)
+}.
+$$
+
+在允许区间内 $[g_{\delta_i}]_+=0$，导数直接取 0，因此不会在
+$\delta_i=0$ 使用 $|\delta_i|$ 的不确定导数。
+
+#### 17.2.4 从四执行器梯度回传到 15 维平坦变量
+
+单个采样点的总幅值罚函数为
+
+$$
+p=p_{T_1}+p_{T_2}+p_{\delta_1}+p_{\delta_2}+p_{\mathrm{invalid}}.
+$$
+
+对有效映射，$p_{\mathrm{invalid}}=0$。把四个连续执行器分量的导数组成
+
+$$
+\mathbf g_u=
+\frac{\partial p}{\partial\mathbf u_a}
+=
+\begin{bmatrix}
+\partial p_{T_1}/\partial T_1\\
+\partial p_{T_2}/\partial T_2\\
+\partial p_{\delta_1}/\partial\delta_1\\
+\partial p_{\delta_2}/\partial\delta_2
+\end{bmatrix},
+$$
+
+则由
+
+$$
+\mathrm dp=\mathbf g_u^T\mathrm d\mathbf u_a
+=\mathbf g_u^T\mathbf J_{u\xi}\mathrm d\boldsymbol\xi
+$$
+
+得到单点罚函数对平坦变量的列梯度：
+
+$$
+\boxed{
+\mathbf g_\xi=\mathbf J_{u\xi}^\top\mathbf g_u
+}.
+$$
+
+`flat_gradient.segment<3>(...)` 正是在读取 $\mathbf g_\xi$ 中对应
+$\mathbf v,\mathbf a,\mathbf j,\mathbf s$ 的四个三维块，最后三项分别对应
+$\psi,\dot\psi,\ddot\psi$。
+
+若标称平坦映射无效，`linearize()` 返回 `differentiable=false`。此时该样本的
+有限执行器罚值和 $p_{\mathrm{invalid}}$ 都按局部常数屏障处理，代码只保留
+“积分区间长度改变”产生的时间导数，不伪造穿过负推力或分配奇异区域的局部
+方向。这也是当前方法要求阶段 A 初值位于有效分支邻域的原因。
+
+### 17.3 第三步：传播到样条系数和分段时间
+
+#### 17.3.1 分段多项式与基函数
+
+第 $i$ 段使用局部时间 $t\in[0,T_i]$。位置七次多项式写成
+
+$$
+\mathbf p_i(t)=C_i^T\boldsymbol\beta_0(t),\qquad
+C_i\in\mathbb R^{8\times3},
+$$
+
+其中
+
+$$
+\boldsymbol\beta_0(t)=
+\begin{bmatrix}1&t&t^2&t^3&t^4&t^5&t^6&t^7\end{bmatrix}^T.
+$$
+
+令
+
+$$
+\boldsymbol\beta_r(t)=\frac{\mathrm d^r\boldsymbol\beta_0}{\mathrm dt^r},
+$$
+
+则
+
+$$
+\mathbf p_i^{(r)}(t)=C_i^T\boldsymbol\beta_r(t).
+$$
+
+例如代码使用的四组基函数为
+
+$$
+\begin{aligned}
+\boldsymbol\beta_1^T&=[0,1,2t,3t^2,4t^3,5t^4,6t^5,7t^6],\\
+\boldsymbol\beta_2^T&=[0,0,2,6t,12t^2,20t^3,30t^4,42t^5],\\
+\boldsymbol\beta_3^T&=[0,0,0,6,24t,60t^2,120t^3,210t^4],\\
+\boldsymbol\beta_4^T&=[0,0,0,0,24,120t,360t^2,840t^3].
+\end{aligned}
+$$
+
+yaw 三次多项式写成
+
+$$
+\psi_i(t)=D_i^T\boldsymbol\gamma_0(t),\qquad
+D_i\in\mathbb R^{4\times1},\qquad
+\boldsymbol\gamma_0=[1,t,t^2,t^3]^T,
+$$
+
+并使用
+
+$$
+\boldsymbol\gamma_1=[0,1,2t,3t^2]^T,\qquad
+\boldsymbol\gamma_2=[0,0,2,6t]^T.
+$$
+
+#### 17.3.2 单个积分节点对多项式系数的偏导
+
+把上一节得到的 15 维梯度分块为
+
+$$
+\mathbf g_\xi=
+\begin{bmatrix}
+\mathbf g_v\\\mathbf g_a\\\mathbf g_j\\\mathbf g_s\\
+g_\psi\\g_{\dot\psi}\\g_{\ddot\psi}
+\end{bmatrix}.
+$$
+
+固定采样局部时间时，位置导数的微分为
+
+$$
+\mathrm d\mathbf v=(\mathrm dC_i)^T\boldsymbol\beta_1,\quad
+\mathrm d\mathbf a=(\mathrm dC_i)^T\boldsymbol\beta_2,\quad
+\mathrm d\mathbf j=(\mathrm dC_i)^T\boldsymbol\beta_3,\quad
+\mathrm d\mathbf s=(\mathrm dC_i)^T\boldsymbol\beta_4.
+$$
+
+利用标量
+$\mathbf g_v^T(\mathrm dC_i)^T\boldsymbol\beta_1
+=\langle\boldsymbol\beta_1\mathbf g_v^T,\mathrm dC_i\rangle_F$，得到一个权重为
+$w_{ik}$ 的节点对位置系数的贡献：
+
+$$
+\boxed{
+G_{C_i}\mathrel{+}=w_{ik}\left(
+\boldsymbol\beta_1\mathbf g_v^T
++\boldsymbol\beta_2\mathbf g_a^T
++\boldsymbol\beta_3\mathbf g_j^T
++\boldsymbol\beta_4\mathbf g_s^T
+\right)
+}.
+$$
+
+这里 $\langle A,B\rangle_F=\operatorname{tr}(A^TB)$ 是 Frobenius 内积，
+$G_{C_i}=\partial J_{\mathrm{act}}/\partial C_i\in\mathbb R^{8\times3}$。
+
+同理，yaw 系数梯度为
+
+$$
+\boxed{
+G_{D_i}\mathrel{+}=w_{ik}\left(
+\boldsymbol\gamma_0g_\psi
++\boldsymbol\gamma_1g_{\dot\psi}
++\boldsymbol\gamma_2g_{\ddot\psi}
+\right)
+}.
+$$
+
+这两个公式分别对应代码中的 `position_block.noalias() += ...` 和
+`yaw_block.noalias() += ...`。
+
+#### 17.3.3 梯形积分对当前分段时间的显式偏导
+
+每段使用 $N$ 个等长区间和 $N+1$ 个节点。定义
+
+$$
+s_k=\frac{k}{N},\qquad t_{ik}=s_kT_i,\qquad
+c_k=
+\begin{cases}
+\frac12,&k=0\ \text{或}\ k=N,\\
+1,&\text{其他节点},
+\end{cases}
+$$
+
+$$
+w_{ik}=\frac{T_i}{N}c_k.
+$$
+
+于是执行器积分近似为
+
+$$
+J_{\mathrm{act}}
+=\sum_i\sum_{k=0}^{N}w_{ik}\,p(\boldsymbol\xi_i(t_{ik})).
+$$
+
+先固定多项式系数 $C_i,D_i$，只对当前 $T_i$ 求显式偏导。因为
+
+$$
+\frac{\partial w_{ik}}{\partial T_i}=\frac{c_k}{N},\qquad
+\frac{\partial t_{ik}}{\partial T_i}=s_k,
+$$
+
+而
+
+$$
+\frac{\mathrm dp}{\mathrm dt}
+=\mathbf g_\xi^T\dot{\boldsymbol\xi},
+$$
+
+所以单节点满足
+
+$$
+\boxed{
+\left.
+\frac{\partial(w_{ik}p_{ik})}{\partial T_i}
+\right|_{C_i,D_i}
+=\frac{c_k}{N}p_{ik}
++w_{ik}s_k\mathbf g_\xi^T\dot{\boldsymbol\xi}_{ik}
+}.
+$$
+
+第一项来自积分步长 $T_i/N$ 的变化，第二项来自节点
+$t_{ik}=s_kT_i$ 在段内移动。漏掉第一项会把常值罚函数的积分梯度错误地算成零；
+漏掉第二项则会把罚函数峰值在段内移动的影响丢掉。
+
+这里
+
+$$
+\boxed{
+\dot{\boldsymbol\xi}=
+\begin{bmatrix}
+\mathbf a\\\mathbf j\\\mathbf s\\\mathbf p^{(5)}\\
+\dot\psi\\\ddot\psi\\\psi^{(3)}
+\end{bmatrix}
+}.
+$$
+
+因此需要 Crackle $\mathbf p^{(5)}$ 和 yaw Jerk $\psi^{(3)}$。它们不参与当前
+时刻的执行器值 $\mathbf u_a$，但参与“采样时刻随段时间移动”的导数。
+
+前面各段时长变化会同时移动当前段的绝对起点和全局查询时刻，两者相消，当前
+多项式仍在相同的局部坐标 $t_{ik}$ 上求值。因此显式项只需要当前段的
+$s_k\dot{\boldsymbol\xi}$，不需要额外累加所有前序段起点的导数。
+
+#### 17.3.4 为什么还要调用 `propagateGrad()`
+
+上面的时间公式是在 $C_i,D_i$ 固定时得到的偏导。但 minimum-snap/minimum-yaw
+样条的系数不是独立优化变量，而是航点和分段时间的函数：
+
+$$
+C=C(P,T),\qquad D=D(\Psi,T).
+$$
+
+记所有节点累加后的显式时间偏导为 $\mathbf g_T^{\mathrm{exp}}$，则
+
+$$
+\mathrm dJ_{\mathrm{act}}
+=\langle G_C,\mathrm dC\rangle_F
++\langle G_D,\mathrm dD\rangle_F
++(\mathbf g_T^{\mathrm{exp}})^T\mathrm d\mathbf T.
+$$
+
+代入
+
+$$
+\mathrm dC=C_P\mathrm dP+C_T\mathrm d\mathbf T,\qquad
+\mathrm dD=D_\Psi\mathrm d\Psi+D_T\mathrm d\mathbf T,
+$$
+
+可得总梯度
+
+$$
+\boxed{
+\begin{aligned}
+\mathbf g_{P}^{\mathrm{act}}&=C_P^*[G_C],\\
+\mathbf g_{\Psi}^{\mathrm{act}}&=D_\Psi^*[G_D],\\
+\mathbf g_T^{\mathrm{act}}
+&=\mathbf g_T^{\mathrm{exp}}
++C_T^*[G_C]+D_T^*[G_D].
+\end{aligned}
+}.
+$$
+
+上标 $*$ 表示 Jacobian 的伴随作用，不要求显式构造巨大的 Jacobian 矩阵。
+`position_.propagateGrad()` 和 `yaw_.propagateGrad()` 正是在执行这些伴随运算；
+第 14.16 节说明了内部节点导数通过
+$A^T\boldsymbol\lambda=\mathbf g_X$ 反传的具体公式。这样得到的
+$\mathbf g_T^{\mathrm{act}}$ 已经同时包含：
+
+1. 积分步长变化；
+2. 采样节点在段内移动；
+3. 多项式系数随段时间改变；
+4. minimum-snap/minimum-yaw 内部最优导数随航点和时间改变。
+
+只把第 17.3.3 节的显式时间项交给优化器是不完整的。
+
+#### 17.3.5 平滑能量的梯度
+
+平滑项为
+
+$$
+J_{\mathrm{smooth}}
+=\sum_i\int_0^{T_i}\|\mathbf p_i^{(4)}(t)\|^2\,\mathrm dt
++\lambda_\psi\sum_i\int_0^{T_i}\ddot\psi_i^2(t)\,\mathrm dt.
+$$
+
+它不经过执行器映射，直接由两套样条的 `getEnergyGrad()` 得到
+
+$$
+\mathbf g_P^{\mathrm{smooth}},\qquad
+\mathbf g_\Psi^{\mathrm{smooth}},\qquad
+\mathbf g_T^{\mathrm{smooth}}.
+$$
+
+这些同样是包含内部最优导数隐式变化的总梯度，不是固定多项式系数下的局部
+偏导。
+
+### 17.4 第四步：传播到真正的五个优化变量
+
+#### 17.4.1 先组合物理时间和物理航点梯度
+
+Stage B 的目标重新写为
+
+$$
+J_B
+=\rho_s\frac{J_{\mathrm{smooth}}}{J_{\mathrm{smooth}}^0}
++\rho_aJ_{\mathrm{act}}
++\rho_g\|\mathbf u\|^2.
+$$
+
+$J_{\mathrm{smooth}}^0$ 是优化开始前计算并固定的标量，因此不需要对分母求导。
+对物理分段时间和内部位置航点，先得到
+
+$$
+\boxed{
+\mathbf g_T
+=\frac{\rho_s}{J_{\mathrm{smooth}}^0}
+\mathbf g_T^{\mathrm{smooth}}
++\rho_a\mathbf g_T^{\mathrm{act}}
+},
+$$
+
+$$
+\boxed{
+\mathbf g_P
+=\frac{\rho_s}{J_{\mathrm{smooth}}^0}
+\mathbf g_P^{\mathrm{smooth}}
++\rho_a\mathbf g_P^{\mathrm{act}}
+}.
+$$
+
+代码也计算了 yaw 内部航点梯度
+
+$$
+\mathbf g_\Psi
+=\frac{\rho_s}{J_{\mathrm{smooth}}^0}
+\mathbf g_\Psi^{\mathrm{smooth}}
++\rho_a\mathbf g_\Psi^{\mathrm{act}},
+$$
+
+但当前 Stage B 的 yaw 航点固定，不进入 NLopt 变量，所以该梯度暂时不写入最终
+变量向量。以后若开放辅助 yaw，可直接复用这一结果。
+
+#### 17.4.2 固定总时间 softmax 的完整推导
+
+设共有 $M$ 段，引入 logits $z_i$，其中最后一个固定为
+
+$$
+z_M=0,\qquad z_j=\tau_j,\quad j=1,\ldots,M-1.
+$$
+
+定义
+
+$$
+S=\sum_{r=1}^{M}e^{z_r},\qquad
+T_i=\bar T\frac{e^{z_i}}{S}.
+$$
+
+对任意自由 $\tau_j$，有
+
+$$
+\begin{aligned}
+\frac{\partial T_i}{\partial\tau_j}
+&=\bar T
+\frac{\delta_{ij}e^{z_i}S-e^{z_i}e^{z_j}}{S^2}\\
+&=T_i\left(\delta_{ij}-\frac{e^{z_j}}{S}\right)\\
+&=\boxed{T_i\left(\delta_{ij}-\frac{T_j}{\bar T}\right)}.
+\end{aligned}
+$$
+
+这里的 $i$ 包括固定 logit 对应的最后一段，因此其他 logits 改变时 $T_M$ 仍会
+通过分母变化。链式法则给出
+
+$$
+\begin{aligned}
+\frac{\partial J_B}{\partial\tau_j}
+&=\sum_{i=1}^{M}g_{T_i}
+\frac{\partial T_i}{\partial\tau_j}\\
+&=T_jg_{T_j}
+-\frac{T_j}{\bar T}\sum_{i=1}^{M}T_i g_{T_i}.
+\end{aligned}
+$$
+
+即代码使用的形式
+
+$$
+\boxed{
+\frac{\partial J}{\partial\tau_j}
+=T_j\left(
+g_{T_j}-\frac{1}{\bar T}\sum_iT_i g_{T_i}
+\right)
+}.
+$$
+
+其中
+
+$$
+\bar g_T=\frac{1}{\bar T}\sum_iT_i g_{T_i}
+$$
+
+就是代码中的 `weighted_mean`。每个 logit 梯度只取决于本段物理时间梯度相对
+加权平均值的差。所有段的共同时间伸缩方向已被固定总时间约束消除，而且任意
+迭代都严格满足 $T_i>0$ 和 $\sum_iT_i=\bar T$。
+
+#### 17.4.3 辅助点归一化变量的链式法则
+
+辅助点使用
+
+$$
+\mathbf q=\mathbf q^0+\operatorname{diag}(\mathbf h)\mathbf u,
+$$
+
+因此
+
+$$
+\frac{\partial\mathbf q}{\partial\mathbf u}
+=\operatorname{diag}(\mathbf h).
+$$
+
+几何代价定义在归一化变量上：
+
+$$
+J_{\mathrm{geometry}}=\|\mathbf u\|^2,\qquad
+\nabla_\mathbf uJ_{\mathrm{geometry}}=2\mathbf u.
+$$
+
+所以第 $k$ 个轴的最终梯度为
+
+$$
+\boxed{
+\frac{\partial J}{\partial u_k}
+=h_k\frac{\partial J}{\partial q_k}+2\rho_g u_k.
+}
+$$
+
+若辅助点是位置矩阵的第 $r$ 行，样条返回的 `inner_points` 不包含首端点，所以
+代码读取第 $r-1$ 行。这是索引布局转换，不是额外数学近似。
+
+#### 17.4.4 当前五维梯度的最终形式
+
+当前例子有三段时间和一个三维辅助点，因此 NLopt 变量是
+
+$$
+\mathbf x=
+\begin{bmatrix}\tau_1&\tau_2&u_x&u_y&u_z\end{bmatrix}^T.
+$$
+
+最终传给 L-BFGS 的梯度为
+
+$$
+\boxed{
+\nabla_\mathbf xJ_B=
+\begin{bmatrix}
+T_1(g_{T_1}-\bar g_T)\\
+T_2(g_{T_2}-\bar g_T)\\
+h_xg_{q_x}+2\rho_gu_x\\
+h_yg_{q_y}+2\rho_gu_y\\
+h_zg_{q_z}+2\rho_gu_z
+\end{bmatrix}
+}.
+$$
+
+从最内层到最外层，完整计算图可以概括为
+
+$$
+\boxed{
+\boldsymbol\xi
+\xrightarrow{\;\mathbf J_{u\xi}\;}
+\mathbf u_a
+\xrightarrow{\;\mathbf g_u\;}
+p
+\xrightarrow{\text{quadrature}}
+(G_C,G_D,\mathbf g_T^{\mathrm{exp}})
+\xrightarrow{\text{spline adjoint}}
+(\mathbf g_P,\mathbf g_\Psi,\mathbf g_T)
+\xrightarrow{\text{softmax/auxiliary}}
+\nabla_\mathbf xJ_B
+}.
+$$
+
+#### 17.4.5 数学符号与代码变量的逐项对应
+
+| 数学量 | 代码变量 | 维度/含义 |
+| --- | --- | --- |
+| $\mathbf J_{u\xi}$ | `linearization.jacobian` | $4\times15$ 固定分支执行器 Jacobian |
+| $\mathbf g_u$ | `actuator_penalty_gradient` | $4\times1$ 罚函数对四执行器梯度 |
+| $\mathbf g_\xi$ | `flat_gradient` | $15\times1$ 单点罚函数对平坦变量梯度 |
+| $G_C$ | `partial_position_coefficients` | 每段 $8\times3$ 的位置系数偏导 |
+| $G_D$ | `partial_yaw_coefficients` | 每段 $4\times1$ 的 yaw 系数偏导 |
+| $\mathbf g_T^{\mathrm{exp}}$ | `partial_position_times` | 梯形权重和移动节点产生的显式时间偏导 |
+| $\mathbf g_T^{\mathrm{act}}$ | `actuator_gradient.times` | 样条伴随传播后的执行器总时间梯度 |
+| $\mathbf g_T$ | `duration_gradient` | 加权组合后的物理分段时间梯度 |
+| $\bar g_T$ | `weighted_mean` | softmax 链式法则中的时间梯度加权平均 |
+| $\nabla_\mathbf xJ_B$ | `objective_gradient` | 最终交给 NLopt 的变量梯度 |
+
+`partial_yaw_times` 当前初始化为零，因为第 17.3.3 节的显式积分时间偏导只需保存
+一次；`propagateCostGradient()` 最终把位置和 yaw 两套样条传播出的时间梯度
+相加。把显式项放在 `partial_position_times` 而不是重复放进两者，可以避免对同一
+积分权重求导两次。
+
+### 17.5 第五步：两层有限差分验证
+
+有限差分没有进入优化循环，只用于测试解析梯度。对待检查变量 $y_l$，步长取
+
+$$
+h_l=\epsilon\max(1,|y_l|),
+$$
+
+中心差分为
+
+$$
+\boxed{
+g_l^{\mathrm{FD}}
+=\frac{J(\mathbf y+h_l\mathbf e_l)-J(\mathbf y-h_l\mathbf e_l)}{2h_l}
+}.
+$$
+
+在函数足够光滑且没有分支切换时，其截断误差为 $O(h_l^2)$。测试分成两层：
+
+1. 在一条有效运动轨迹上选择采样点，冻结上一姿态和当前分支，对 15 个平坦
+   输出导数逐一做中心差分，与 $4\times15$ 自动微分雅可比比较；
+2. 分别在 yaw `0 -> 0` 和 `0 -> pi` 的阶段 A 初值处，对两个时间 logits 和
+   三个辅助点变量逐一做中心差分，与完整 Stage B 目标梯度比较；零 yaw 工况
+   会激活舵面罚函数，从而覆盖绝对值的局部导数。
+
+单点执行器 Jacobian 使用 $\epsilon=2\times10^{-6}$，完整目标梯度使用
+$\epsilon=10^{-6}$。每个分量使用缩放误差
+
+$$
+\boxed{
+e_l=
+\frac{|g_l^{\mathrm{analytic}}-g_l^{\mathrm{FD}}|}
+{\max(1,|g_l^{\mathrm{analytic}}|,|g_l^{\mathrm{FD}}|)}
+}.
+$$
+
+分母中的 1 避免接近零的梯度仅因相对除法而显示巨大误差，同时对于大梯度仍
+采用相对尺度。单点测试还明确要求正负扰动后的 `roll_branch` 和
+`pitch_branch` 与标称值一致；若发生分支切换，该点不适合验证固定分支
+Jacobian，测试直接失败而不是把跨分支差分误认为解析梯度错误。
+
+单点雅可比测试的最大缩放分量误差阈值为 $2\times10^{-4}$，完整目标梯度阈值
+为 $5\times10^{-4}$。当前两个回归工况中的完整目标梯度最大误差为
+
+$$
+\boxed{3.35239\times10^{-7}},
+$$
+
+明显低于测试阈值。这个结果同时验证了执行器局部雅可比、积分权重、移动节点、
+样条反向传播、softmax 和辅助点缩放，而不是只验证其中一个公式。
+
+### 17.6 第六步：切换 L-BFGS 并做端到端回归
+
+只有上述两层梯度检查通过后，阶段 B 才从 `LN_SBPLX` 切换为
+`NLopt::LD_LBFGS`。当前默认应用结果为：
+
+| 工况 | L-BFGS 目标评估数 | 组合目标 | 执行器积分 |
+| --- | ---: | ---: | ---: |
+| yaw `0 -> 0` | 14 | `1.045824 -> 1.011050` | 约 `2.30e-4 -> 2.8e-5` |
+| yaw `0 -> pi` | 21 | `1.145326 -> 1.045637` | 约 `7.27e-4 -> 8.3e-5` |
+
+两种工况的最终轨迹都通过真实物理幅值的 `2 ms` 稠密开环检查。完整 CTest 同时
+运行阶段 A 和阶段 B，当前结果为 `2/2 passed`。
+
+### 17.7 这一步解决了什么，仍未解决什么
+
+已经解决：
+
+- 不再依赖无梯度搜索估计执行器罚函数方向；
+- 执行器梯度已经贯通到分段时间和辅助航点；
+- 梯度由两层独立中心有限差分保护；
+- 阶段 B 可以使用 L-BFGS，并保留原稠密物理认证。
+
+仍未解决：
+
+- 分支切换面、负单电机推力和分配奇异区并非全局光滑；
+- 当前执行器限制仍是采样平方罚函数，不是连续时间硬约束；
+- 尚未完成 `paper_control` 闭环跟踪认证。
+
+第 16.9 节前两项已在第 18 章完成。下一步是接入 `paper_control` 闭环仿真，
+再用实际跟踪误差、饱和持续时间和控制裕度标定规划用 `actuator_margin`。当前
+约束仍是离散采样软罚函数，因此不应被表述为已经获得全局可微或连续时间严格
+可行的规划器。
+
+### 17.8 结合代码理解完整梯度执行路径
+
+前面各节给出了数学推导，本节按照一次 NLopt 目标回调真正执行的顺序，把公式与
+代码逐项对应。阅读顺序建议为：
+
+```text
+planning_types.hpp
+        ↓
+tailsitter_flatness.cpp: forward() / linearize()
+        ↓
+actuator_penalty_optimizer.cpp: integrateActuatorPenalty()
+        ↓
+flat_output_trajectory.cpp: propagateCostGradient()
+        ↓
+actuator_penalty_optimizer.cpp: evaluate() / objective()
+        ↓
+test_stage_b.cpp: 两层有限差分
+```
+
+#### 17.8.1 `ActuatorLinearization` 固定了 Jacobian 的接口契约
+
+`planning/include/planning/planning_types.hpp` 中的核心定义为：
+
+```cpp
+static constexpr int flat_derivative_dimension = 15;
+static constexpr int actuator_dimension = 4;
+static constexpr int velocity_offset = 0;
+static constexpr int acceleration_offset = 3;
+static constexpr int jerk_offset = 6;
+static constexpr int snap_offset = 9;
+static constexpr int yaw_index = 12;
+static constexpr int yaw_rate_index = 13;
+static constexpr int yaw_acceleration_index = 14;
+
+Eigen::Matrix<double, actuator_dimension,
+              flat_derivative_dimension> jacobian;
+Eigen::Matrix<double, 3,
+              flat_derivative_dimension> angular_velocity_jacobian;
+```
+
+这些 offset 不是仅供注释使用，而是同时被以下位置引用：
+
+- AutoDiff 独立变量的种子设置；
+- `flat_gradient` 的四个三维位置导数分块；
+- yaw 三个标量梯度的读取；
+- 单点有限差分的变量扰动。
+
+因此代码中的第 0～2 列始终对应 $\mathbf v$，第 3～5 列对应 $\mathbf a$，
+第 6～8 列对应 $\mathbf j$，第 9～11 列对应 $\mathbf s$，最后三列依次对应
+$\psi,\dot\psi,\ddot\psi$。如果以后增加风速、机体角速度约束或其他独立变量，
+必须在这里统一扩展维数和 offset，不能只修改某一个局部循环。
+
+其中 `jacobian` 是 $(T_1,T_2,\delta_1,\delta_2)$ 对 $\boldsymbol\xi$ 的
+$4\times15$ Jacobian；新增的 `angular_velocity_jacobian` 是
+$\boldsymbol\Omega$ 对同一个 $\boldsymbol\xi$ 的 $3\times15$ Jacobian。
+
+`ActuatorPrediction` 额外保存 `roll_branch` 和 `pitch_branch`。普通预测负责给出
+标称值和分支编号，`ActuatorLinearization` 则把这份预测与当前分支的局部 Jacobian
+绑定在一起，避免调用者误把某个分支的梯度配到另一个分支的执行器值上。
+
+#### 17.8.2 `forward()` 仍然是分支选择和标称值的唯一来源
+
+`planning/src/tailsitter_flatness.cpp` 的 `forward()` 枚举四种组合：
+
+```cpp
+for (int roll_branch = 0; roll_branch < 2; ++roll_branch)
+{
+    ...
+    for (int pitch_branch = 0; pitch_branch < 2; ++pitch_branch)
+    {
+        ...
+        candidates.push_back({..., roll_branch, pitch_branch});
+    }
+}
+```
+
+随后使用 `std::min_element` 选择四元数距离最小的合法候选，并保存：
+
+```cpp
+output.roll_branch = selected->roll_branch;
+output.pitch_branch = selected->pitch_branch;
+```
+
+这里没有把 `forward()` 整体替换成 AutoDiff 版本，原因是候选枚举、负推力过滤、
+四元数距离比较和 `min_element` 都是离散逻辑。普通 `forward()` 继续承担三个
+职责：
+
+1. 决定当前标称轨迹究竟使用哪个姿态分支；
+2. 返回完整的姿态、角速度、力矩、电机转速和舵面信息；
+3. 给出映射是否有效以及失败原因。
+
+AutoDiff 代码只对它选出的连续分支求局部导数，不改变原有物理判断路径。
+
+#### 17.8.3 `ADScalar` 如何一次携带 15 个方向导数
+
+文件中定义：
+
+```cpp
+using FlatDerivativeVector =
+    Eigen::Matrix<double, ActuatorLinearization::flat_derivative_dimension, 1>;
+using ADScalar = Eigen::AutoDiffScalar<FlatDerivativeVector>;
+```
+
+因此一个 `ADScalar` 实际保存
+
+```text
+value                  一个标称标量
+derivatives()[0..14]   对 15 个平坦变量的梯度
+```
+
+`independentAD()` 设置单位种子：
+
+```cpp
+ADScalar result(value);
+result.derivatives().setZero();
+result.derivatives()[derivative_index] = 1.0;
+```
+
+数学上就是第 17.1.3 节的
+$\widehat\xi_l=(\xi_l,\mathbf e_l)$。随后
+`differentiableFlatDerivativeInput()` 按 offset 逐项播种：
+
+```cpp
+result.velocity[axis] = independentAD(sample.velocity[axis], 0 + axis);
+result.acceleration[axis] = independentAD(sample.acceleration[axis], 3 + axis);
+result.jerk[axis] = independentAD(sample.jerk[axis], 6 + axis);
+result.snap[axis] = independentAD(sample.snap[axis], 9 + axis);
+result.yaw = independentAD(sample.yaw, 12);
+result.yaw_rate = independentAD(sample.yaw_rate, 13);
+result.yaw_acceleration = independentAD(sample.yaw_acceleration, 14);
+```
+
+所以这不是对 15 个变量循环调用 15 次完整平坦映射，而是一次带 15 维导数向量
+的前向传播。
+
+#### 17.8.4 `DifferentiableJet2` 为什么是嵌套导数而不是重复求导
+
+模板定义为：
+
+```cpp
+template <typename Scalar>
+struct DifferentiableJet2
+{
+    Scalar value;
+    Scalar first;
+    Scalar second;
+};
+```
+
+当 `Scalar=double` 时，它只计算固定分支的普通数值；当
+`Scalar=ADScalar` 时，三个成员分别表示：
+
+| 成员 | 数值含义 | 成员内部的 AutoDiff 梯度 |
+| --- | --- | --- |
+| `value` | $x$ | $\partial x/\partial\boldsymbol\xi$ |
+| `first` | $\dot x$ | $\partial\dot x/\partial\boldsymbol\xi$ |
+| `second` | $\ddot x$ | $\partial\ddot x/\partial\boldsymbol\xi$ |
+
+例如构造速度和参考力时：
+
+```cpp
+const DVector velocity{{{input.velocity.x(),
+                         input.acceleration.x(),
+                         input.jerk.x()}, ...}};
+
+const DVector force{{{m * input.acceleration.x(),
+                      m * input.jerk.x(),
+                      m * input.snap.x()}, ...}};
+```
+
+第一层三元组实现
+$\mathcal J_2[\mathbf v]=(\mathbf v,\mathbf a,\mathbf j)$ 和
+$\mathcal J_2[\mathbf f]=(\mathbf f,\dot{\mathbf f},\ddot{\mathbf f})$；每个三元组
+成员内部的 `ADScalar` 再传播它对 15 个优化相关变量的敏感度。前者回答“沿时间
+怎么变化”，后者回答“当前轨迹参数小幅改变时怎么变化”，二者不能互换。
+
+#### 17.8.5 `evaluateFixedBranchActuators()` 如何复用一套公式
+
+该函数是模板：
+
+```cpp
+template <typename Scalar>
+FixedBranchActuators<Scalar> evaluateFixedBranchActuators(
+    const FlatDerivativeInput<Scalar>& input,
+    int roll_branch,
+    int pitch_branch,
+    const VehicleParameters& parameters);
+```
+
+同一函数会执行两次：
+
+- `Scalar=double`：检查选定分支在连续公式中确实有效；
+- `Scalar=ADScalar`：计算相同分支的执行器值及 $4\times15$ Jacobian。
+
+roll 和 pitch 直接写成
+
+```cpp
+phi = phi_base + roll_branch * pi;
+theta_bar = theta_base + pitch_branch * pi;
+```
+
+函数内部没有候选循环和 `argmin`，所以 AutoDiff 计算图只包含当前连续分支。
+总推力、角速度、刚体力矩和差分推力仍严格使用第 15 章的原公式。例如：
+
+```cpp
+moment = inertia * angular_acceleration +
+         angular_velocity.cross(inertia * angular_velocity);
+
+differential_thrust = moment.z() / differential_denominator;
+thrust_1 = 0.5 * (thrust + differential_thrust);
+thrust_2 = 0.5 * (thrust - differential_thrust);
+```
+
+因为这些变量都是 `Scalar`，第 17.1.5 节的
+$\mathrm d\mathbf M,\mathrm d\Delta T,\mathrm dT_1,\mathrm dT_2$ 会自动随每次
+算术操作传播。
+
+舵面部分没有调用只支持普通 `double` 的 SVD/LU 来求导，而是显式写出二维逆：
+
+```cpp
+determinant = a00 * a11 - a01 * a10;
+flap_1 = (a11 * mx - a01 * my) / determinant;
+flap_2 = (-a10 * mx + a00 * my) / determinant;
+```
+
+当矩阵元素、右端力矩和行列式都是 `ADScalar` 时，这段代码自然包含
+$\mathrm dA_\delta$、$\mathrm d\mathbf m_\delta$ 和逆矩阵分母的导数，等价于
+第 17.1.6 节的
+
+$$
+\mathrm d\boldsymbol\delta
+=A_\delta^{-1}
+(\mathrm d\mathbf m_\delta-\mathrm dA_\delta\boldsymbol\delta).
+$$
+
+所有奇异性、负推力和有限性判断只决定是否继续构造当前局部模型；代码不会对
+这些 `if` 条件本身求导。
+
+#### 17.8.6 `linearize()` 如何把 AD 输出整理成矩阵
+
+`TailsitterFlatness::linearize()` 的调用顺序可以直接对应第 17.1.2 节：
+
+```cpp
+output.prediction = forward(sample, previous_branch);
+if (!output.prediction.valid)
+    return output;
+
+nominal = evaluateFixedBranchActuators(
+    flatDerivativeInput(sample), selected_roll, selected_pitch, parameters_);
+
+differentiated = evaluateFixedBranchActuators(
+    differentiableFlatDerivativeInput(sample),
+    selected_roll, selected_pitch, parameters_);
+```
+
+第一次 `forward()` 决定分支并保留完整标称预测；`nominal` 调用保证新写的固定
+分支公式在普通数值下有效；`differentiated` 调用才生成梯度。最后按照固定输出
+顺序组成数组：
+
+```cpp
+{differentiated.thrust_1,
+ differentiated.thrust_2,
+ differentiated.flap_1,
+ differentiated.flap_2}
+```
+
+并逐行提取：
+
+```cpp
+output.jacobian.row(actuator) =
+    actuators[actuator].derivatives().transpose();
+```
+
+`derivatives()` 是 $15\times1$ 列向量，而 Jacobian 的一个执行器需要
+$1\times15$ 行，所以这里必须转置。只有四行全部有限，才设置
+`differentiable=true`。
+
+#### 17.8.7 `integrateActuatorPenalty()` 中一次采样点怎样反传
+
+该函数先按分段数分配反向传播缓存：
+
+```cpp
+partial_position_coefficients: (8 * segment_count) x 3
+partial_yaw_coefficients:      (4 * segment_count) x 1
+partial_position_times:        segment_count x 1
+partial_yaw_times:             segment_count x 1
+```
+
+七次位置样条每段有 8 行系数，三次 yaw 样条每段有 4 行系数，因此可以用
+`middleRows(segment_index * COEFF_NUM, COEFF_NUM)` 直接取得当前段对应的块。
+
+每个节点先计算
+
+```cpp
+local_fraction = sample_index / samples_per_segment;
+local_time = local_fraction * duration;
+quadrature_weight = duration / samples_per_segment * trap_weight;
+```
+
+这三项分别对应 $s_k,t_{ik},w_{ik}$。`BranchState branch` 在整个双重循环外创建，
+每次有效姿态写回后传给下一节点，使 `linearize()` 的标称分支沿积分时间保持连续。
+
+NLopt 请求梯度时执行：
+
+```cpp
+linearization = flatness.linearize(sample, branch);
+prediction = linearization.prediction;
+```
+
+只求初值、终值报告时则调用更便宜的 `forward()`。罚函数辅助函数同时返回
+`value` 和 `derivative`，随后组成
+
+```cpp
+Eigen::Vector4d actuator_penalty_gradient(...);
+flat_gradient = linearization.jacobian.transpose() *
+                actuator_penalty_gradient;
+```
+
+第一行代码就是 $\mathbf g_u$，第二行就是
+$\mathbf g_\xi=\mathbf J_{u\xi}^T\mathbf g_u$。如果某个执行器没有越过软阈值，
+其 `derivative=0`，对应 Jacobian 行不会对当前目标梯度产生贡献；Jacobian 本身
+仍然完整存在。
+
+#### 17.8.8 系数梯度在代码中为什么是基向量外积
+
+位置代码的核心累加为：
+
+```cpp
+position_block += quadrature_weight *
+    (velocity_basis.transpose() * g_v.transpose() +
+     acceleration_basis.transpose() * g_a.transpose() +
+     jerk_basis.transpose() * g_j.transpose() +
+     snap_basis.transpose() * g_s.transpose());
+```
+
+`velocity_basis.transpose()` 是 $8\times1$，`g_v.transpose()` 是 $1\times3$，
+外积结果正好是 $8\times3$，与当前段位置系数矩阵同形。这就是第 17.3.2 节的
+$\boldsymbol\beta_1\mathbf g_v^T$。yaw 对应代码为
+
+```cpp
+yaw_block += quadrature_weight *
+    (yaw_basis.transpose() * g_yaw +
+     yaw_rate_basis.transpose() * g_yaw_rate +
+     yaw_acceleration_basis.transpose() * g_yaw_acceleration);
+```
+
+三个基向量都是 $4\times1$，结果与当前段 yaw 系数块同形。
+
+显式时间梯度首先构造
+
+```cpp
+flat_time_derivative << acceleration, jerk, snap, crackle,
+                        yaw_rate, yaw_acceleration, yaw_jerk;
+```
+
+即 $\dot{\boldsymbol\xi}$，再执行
+
+```cpp
+partial_position_times[i] +=
+    trap_weight / samples_per_segment * sample_penalty +
+    quadrature_weight * local_fraction *
+        flat_gradient.dot(flat_time_derivative);
+```
+
+两项分别是
+
+$$
+\frac{c_k}{N}p_{ik},
+\qquad
+w_{ik}s_k\mathbf g_\xi^T\dot{\boldsymbol\xi}_{ik}.
+$$
+
+若 `linearization.differentiable=false`，代码跳过系数外积和移动节点项，只累加
+第一项。这样常数无效屏障仍会随积分区间长度变化，但不会制造不存在的执行器
+局部 Jacobian。
+
+#### 17.8.9 `FlatOutputTrajectory` 如何调用样条伴随传播
+
+`energyGradient()` 分别读取两套样条自身的完整梯度：
+
+```cpp
+position_gradient = position_.getEnergyGrad();
+yaw_gradient = yaw_.getEnergyGrad();
+
+result.position_inner_points = position_gradient.inner_points;
+result.yaw_inner_points = yaw_weight * yaw_gradient.inner_points;
+result.times = position_gradient.times +
+               yaw_weight * yaw_gradient.times;
+```
+
+yaw 权重必须同时乘内部航点和时间梯度；位置部分的系数为 1。执行器罚函数不是
+样条内置能量，所以 `propagateCostGradient()` 把上一节构造的偏导交给
+`propagateGrad()`：
+
+```cpp
+position_gradient = position_.propagateGrad(
+    partial_position_coefficients, partial_position_times);
+yaw_gradient = yaw_.propagateGrad(
+    partial_yaw_coefficients, partial_yaw_times);
+```
+
+位置和 yaw 的内部航点梯度分别保存，时间梯度则相加，因为两套样条共享同一组
+物理分段时间。这一步执行的是第 17.3.4 节的
+$C_P^*,C_T^*,D_\Psi^*,D_T^*$，而不是重新进行数值差分。
+
+#### 17.8.10 `evaluate()` 如何组装最终 NLopt 梯度
+
+每次回调都先从低维变量重新解码物理轨迹：
+
+```cpp
+durations = durationsFromVariables(variables, context);
+positions = positionsFromVariables(variables, context);
+trajectory.update(durations, positions, yaws);
+```
+
+所以目标值和梯度始终针对同一条刚重建的候选样条。随后计算三项标量：
+
+```cpp
+terms.total = smoothness_weight * normalized_smoothness +
+              geometry_weight * geometry +
+              actuator_weight * actuator.total();
+```
+
+当 `objective_gradient != nullptr` 时，代码取得两种物理梯度并按目标权重组合：
+
+```cpp
+duration_gradient =
+    smoothness_weight / smoothness_reference * smoothness_gradient.times +
+    actuator_weight * actuator_gradient.times;
+```
+
+这就是第 17.4.1 节的 $\mathbf g_T$。接着计算：
+
+```cpp
+weighted_mean += durations[i] * duration_gradient[i];
+weighted_mean /= total_time;
+
+gradient[tau_i] = durations[i] *
+                  (duration_gradient[i] - weighted_mean);
+```
+
+分别对应 $\bar g_T$ 和
+$\partial J/\partial\tau_i=T_i(g_{T_i}-\bar g_T)$。
+
+辅助点代码为：
+
+```cpp
+gradient[variable] = auxiliary_half_range[axis] *
+                         position_inner_gradient(waypoint - 1, axis) +
+                     2.0 * geometry_weight * variables[variable];
+```
+
+第一项是 $h_kg_{q_k}$，第二项是 $2\rho_gu_k$。`waypoint - 1` 是因为样条返回的
+内部航点梯度不包含首端点。
+
+函数开始时把梯度向量清零；若候选构造抛出异常、目标非有限或梯度非有限，则
+返回 $10^{30}$ 并再次把梯度置零。这避免 L-BFGS 读取上一次回调遗留的梯度，
+但该零梯度屏障也说明无效区域不适合作为正常搜索空间。
+
+#### 17.8.11 `objective()` 和 `LD_LBFGS` 的接口关系
+
+NLopt 回调只有三行关键逻辑：
+
+```cpp
+auto& context = *static_cast<ObjectiveContext*>(raw_context);
+++context.evaluations;
+return evaluate(variables, context,
+                gradient.empty() ? nullptr : &gradient).total;
+```
+
+当算法只请求目标值时，`gradient.empty()` 为真，积分器调用普通 `forward()`；
+`LD_LBFGS` 请求一阶梯度时，传入非空向量，整条 AutoDiff 和样条伴随链被打开。
+目标值与梯度共用同一个 `evaluate()`，因此不会出现“报告的目标函数”和“求导的
+目标函数”使用不同公式的问题。
+
+`optimize()` 用阶段 A 时间反算初始 logits：
+
+```cpp
+variables[i] = log(initial_durations[i] / last_duration);
+```
+
+这是 softmax 的精确逆比值，能够恢复原阶段 A 分段比例。随后创建
+`nlopt::LD_LBFGS`、设置变量边界和容差。边界只限制 logits 与归一化辅助点，
+物理分段时间的正值和定和性质由 softmax 本身保证。
+
+#### 17.8.12 两层测试分别能发现哪类错误
+
+`tests/test_stage_b.cpp::checkActuatorJacobian()` 逐一扰动 15 个平坦变量，直接比较
+
+```text
+linearize().jacobian
+        与
+[forward(xi + h e_l) - forward(xi - h e_l)] / (2 h)
+```
+
+它能够定位固定分支平坦映射内部的错误，例如：
+
+- AutoDiff 列 offset 错位；
+- 旋转或力矩公式漏掉一条链；
+- 舵面二维逆没有传播分配矩阵梯度；
+- Jacobian 行顺序与执行器顺序不一致。
+
+`ActuatorPenaltyOptimizer::checkInitialGradient()` 则对最终变量
+$[\tau_1,\tau_2,u_x,u_y,u_z]$ 做中心差分。它还覆盖：
+
+- 平方铰链和绝对值的局部导数；
+- 梯形权重与移动节点时间项；
+- 位置/yaw 样条 `propagateGrad()`；
+- softmax 链式法则；
+- 辅助点缩放和几何项。
+
+测试同时使用 yaw `0 -> 0` 和 `0 -> pi`。为避免新增约束在标称工况中恰好不
+激活，`test_stage_b.cpp` 还只在测试内把机体角速度包络、舵面速率和舵机时间
+常数收紧到 `5 rad/s`、`2 rad/s` 和 `0.2 s`，并明确断言机体角速度、电机动态、
+舵面速率和舵机动态四项初值都大于零。这样完整目标有限差分实际覆盖所有新增
+链路，而不是只检查一组数值为零的形式梯度。车辆默认参数并未被测试值修改。
+
+#### 17.8.13 一次 L-BFGS 回调的最终数据流
+
+把上述函数合并后，一次请求梯度的回调实际执行：
+
+```text
+x = [tau, auxiliary]
+  ├─ durationsFromVariables() ──> T
+  ├─ positionsFromVariables() ──> P
+  └─ FlatOutputTrajectory::update(T, P, Psi)
+          │
+          ├─ energyGradient() ───────────────> g_smooth(P,T)
+          │
+          └─ integrateActuatorPenalty()
+                ├─ sample(t)
+                ├─ forward() 选择 branch
+                ├─ linearize() 得到 J_u_xi
+                ├─ J_u_xi^T g_u ────────────> g_xi
+                ├─ basis outer products ────> G_C, G_D
+                └─ quadrature time terms ───> g_T_exp
+                         │
+                         ▼
+              propagateCostGradient()
+                         │
+                         ▼
+                 g_actuator(P,T)
+                         │
+          ┌──────────────┴──────────────┐
+          ▼                             ▼
+    softmax chain                  auxiliary chain
+          │                             │
+          └──────────────┬──────────────┘
+                         ▼
+                  gradient dJ/dx
+                         │
+                         ▼
+                    NLopt L-BFGS
+```
+
+这条路径也解释了为什么不能只在 `TailsitterFlatness` 中得到
+$\mathbf J_{u\xi}$ 就宣称“优化梯度已经完成”：局部执行器 Jacobian 只是计算图
+中间的一层，必须继续通过积分、样条内部解、时间参数化和辅助点参数化，才能形成
+求解器真正需要的 $\nabla_\mathbf xJ_B$。
+
+---
+
+## 18. 机体角速度、执行器变化率与一阶动态约束
+
+本章按第 16.9 节的前两步继续扩展 Stage B。原来的单电机推力和舵面偏角幅值
+罚函数全部保留；新增约束不是用 $(T,\boldsymbol\Omega)$ 替换原始执行器约束，
+而是在同一个目标中同时检查：
+
+$$
+T_1,T_2,\delta_1,\delta_2,\quad
+\|\boldsymbol\Omega\|,\quad
+\omega_{1,\mathrm{cmd}}^{\mathrm{req}},
+\omega_{2,\mathrm{cmd}}^{\mathrm{req}},\quad
+\dot\delta_1,\dot\delta_2,\quad
+\delta_{1,\mathrm{cmd}}^{\mathrm{req}},
+\delta_{2,\mathrm{cmd}}^{\mathrm{req}}.
+$$
+
+这里的 `req` 表示：如果希望一阶执行器状态严格经过相邻两个规划采样值，该区间
+所需的常值命令。它不是把开环规划输出直接发送给控制器；闭环执行时仍由
+`paper_control` 生成实际命令。
+
+### 18.1 参数来源与适用边界
+
+新增默认参数写在 `VehicleParameters`，并同步记录在两个 YAML 中：
+
+| 参数 | 默认值 | 性质 |
+| --- | ---: | --- |
+| $\Omega_{\max}$ | $650\pi/180=11.34464\ \mathrm{rad/s}$ | `paper_control` differential-thrust turn 报告的约 `650 deg/s` 运动峰值，用作参考包络，并非厂家认证硬限值 |
+| $\tau_m$ | $0.04\ \mathrm{s}$ | 项目 `config.py` 根据论文 Fig. 11 响应估计的电机时间常数 |
+| $\tau_s$ | $0.03\ \mathrm{s}$ | 当前舵机响应量级的工程估计 |
+| $\dot\delta_{\max}$ | $25\ \mathrm{rad/s}$ | 考虑气动负载后的工程速率限制 |
+
+优化用阈值仍统一乘 `actuator_margin`。默认 $m_a=0.75$ 时：
+
+$$
+\Omega_p=0.75\Omega_{\max}=8.50848\ \mathrm{rad/s},\qquad
+\dot\delta_p=0.75\dot\delta_{\max}=18.75\ \mathrm{rad/s}.
+$$
+
+电机转速命令、舵机命令的优化阈值同样分别为物理幅值的 $75\%$。最终
+`FeasibilityChecker` 使用 $m_a=1$ 和约 `2 ms` 采样做完整包络认证。由于
+$650\ \mathrm{deg/s}$ 只是已展示机动的参考峰值，后续仍必须用闭环仿真或实验
+标定更可信的 $\Omega_{\max}$。
+
+### 18.2 机体角速度约束及梯度
+
+#### 18.2.1 罚函数
+
+定义
+
+$$
+r_\Omega=\|\boldsymbol\Omega\|,
+\qquad
+g_\Omega=\frac{r_\Omega-\Omega_p}{\Omega_p},
+\qquad
+p_\Omega=[g_\Omega]_+^2.
+$$
+
+当 $r_\Omega>\Omega_p$ 时，
+
+$$
+\boxed{
+\frac{\partial p_\Omega}{\partial\boldsymbol\Omega}
+=\frac{2g_\Omega}{\Omega_p}
+\frac{\boldsymbol\Omega}{\|\boldsymbol\Omega\|}
+},
+$$
+
+否则梯度为零。真正激活时 $r_\Omega>\Omega_p>0$，所以不存在除以零问题。
+
+#### 18.2.2 从角速度回传到平坦变量
+
+`evaluateFixedBranchActuators()` 原本已经在求刚体力矩之前计算
+$\boldsymbol\Omega$。现在把该 AutoDiff 向量保存在 `FixedBranchActuators` 中，
+`linearize()` 提取
+
+$$
+J_{\Omega\xi}
+=\frac{\partial\boldsymbol\Omega}{\partial\boldsymbol\xi}
+\in\mathbb R^{3\times15}.
+$$
+
+于是角速度罚函数对单点平坦变量的梯度为
+
+$$
+\boxed{
+\mathbf g_\xi^\Omega
+=J_{\Omega\xi}^T
+\frac{\partial p_\Omega}{\partial\boldsymbol\Omega}
+}.
+$$
+
+代码在 `integrateActuatorPenalty()` 中把它与原执行器幅值梯度相加：
+
+```cpp
+FlatGradient flat_gradient =
+    linearization.jacobian.transpose() * actuator_penalty_gradient;
+flat_gradient.noalias() +=
+    linearization.angular_velocity_jacobian.transpose() *
+    body_rate_penalty_gradient;
+```
+
+之后仍通过第 17 章同一套样条系数、分段时间、softmax 和辅助点链路传播，不需要
+为角速度约束另写一套优化器。
+
+### 18.3 为什么执行器动态使用“相邻节点反算命令”
+
+若直接在连续时间写
+
+$$
+u_{\mathrm{cmd}}=u+\tau\dot u,
+\qquad
+\dot u=J_{u\xi}\dot{\boldsymbol\xi},
+$$
+
+则对优化变量求 $\dot u$ 的梯度会出现 $u(\boldsymbol\xi)$ 的 Hessian-vector
+product。它可以用二阶 AutoDiff 求，但实现复杂、计算量较大，而且当前闭环仿真
+本来就以离散时间更新执行器。
+
+当前实现采用与 `main_sim.py` 一致的一阶离散模型。对区间
+$[t_k,t_{k+1}]$，令 $h=t_{k+1}-t_k$，命令在该区间保持常值：
+
+$$
+y_{k+1}=a y_k+(1-a)u_{\mathrm{cmd},k},
+\qquad
+a=e^{-h/\tau}.
+$$
+
+给定规划的相邻状态 $y_k,y_{k+1}$，所需命令可精确反解为
+
+$$
+\boxed{
+u_{\mathrm{cmd},k}^{\mathrm{req}}
+=\frac{y_{k+1}-a y_k}{1-a}
+}.
+$$
+
+对电机取 $y=\omega$、$\tau=\tau_m$；对舵机取 $y=\delta$、
+$\tau=\tau_s$。这相对于所采用的零阶保持离散一阶模型是精确关系，不是
+$\dot u$ 的额外有限差分近似，而且只需要相邻两个节点的一阶 Jacobian。
+
+### 18.4 从推力 Jacobian 转成电机转速 Jacobian
+
+平坦映射的原始电机输出仍是 $T_i$，动态模型的状态则是 $\omega_i$：
+
+$$
+\omega_i=\sqrt{T_i/c_T}.
+$$
+
+在 $\omega_i>0$ 的有效工作点，
+
+$$
+\mathrm dT_i=2c_T\omega_i\,\mathrm d\omega_i,
+$$
+
+所以
+
+$$
+\boxed{
+J_{\omega_i\xi}
+=\frac{1}{2c_T\omega_i}J_{T_i\xi}
+}.
+$$
+
+舵面状态就是 $\delta_i$，其 Jacobian 直接复用原矩阵后两行。代码
+`dynamicActuatorState()` 因而构造
+
+$$
+\mathbf y=
+[\omega_1,\omega_2,\delta_1,\delta_2]^T,
+\qquad
+J_{y\xi}\in\mathbb R^{4\times15}.
+$$
+
+若电机转速接近零，平方根映射的导数会变得病态，代码不伪造该点的动态梯度；
+当前测试轨迹的有效电机工作点均远离零转速。
+
+### 18.5 一阶动态命令罚函数的完整梯度
+
+把单个执行器的反算命令记为
+
+$$
+c(y_0,y_1,h)=\frac{y_1-a y_0}{1-a},qquad a=e^{-h/\tau}.
+$$
+
+三个局部偏导为
+
+$$
+\boxed{
+\frac{\partial c}{\partial y_0}=-\frac{a}{1-a},\qquad
+\frac{\partial c}{\partial y_1}=\frac{1}{1-a}
+},
+$$
+
+$$
+\boxed{
+\frac{\partial c}{\partial h}
+=-\frac{a}{\tau}
+\frac{y_1-y_0}{(1-a)^2}
+}.
+$$
+
+电机命令使用上下界平方罚函数，舵机命令使用对称绝对值平方罚函数。统一把其
+值记为 $p(c)$、导数记为 $p'(c)$。一个区间的积分近似为
+
+$$
+C_{\mathrm{dyn}}=h p(c).
+$$
+
+因此
+
+$$
+\boxed{
+\frac{\partial C_{\mathrm{dyn}}}{\partial y_0}
+=h p'(c)\left(-\frac{a}{1-a}\right),
+\qquad
+\frac{\partial C_{\mathrm{dyn}}}{\partial y_1}
+=h p'(c)\frac{1}{1-a}
+},
+$$
+
+$$
+\boxed{
+\left.\frac{\partial C_{\mathrm{dyn}}}{\partial h}\right|_{y_0,y_1}
+=p(c)+h p'(c)\frac{\partial c}{\partial h}
+}.
+$$
+
+每段有 $N$ 个等长区间，$h=T_i/N$，故最后一式对物理段时间的显式贡献还要
+乘 $\partial h/\partial T_i=1/N$。代码中的 `command_first`、
+`command_second`、`command_step` 和 `explicit_duration_gradient` 分别对应上述
+四个量。
+
+### 18.6 舵面角速度罚函数及梯度
+
+相邻节点上的离散舵面角速度为
+
+$$
+r=\frac{\delta_1-\delta_0}{h}.
+$$
+
+使用规划阈值 $r_p=\dot\delta_p$，定义
+
+$$
+p_r(r)=\left[
+\frac{|r|-r_p}{r_p}
+\right]_+^2,
+\qquad
+C_r=h p_r(r).
+$$
+
+记 $g_r=p_r'(r)$，则
+
+$$
+\boxed{
+\frac{\partial C_r}{\partial\delta_0}=-g_r,
+\qquad
+\frac{\partial C_r}{\partial\delta_1}=g_r
+},
+$$
+
+$$
+\boxed{
+\left.\frac{\partial C_r}{\partial h}\right|_{\delta_0,\delta_1}
+=p_r(r)-g_r r
+}.
+$$
+
+这解释了代码里端点梯度没有额外的 $1/h$：$r$ 对端点的 $1/h$ 与外层积分
+长度 $h$ 正好抵消。
+
+### 18.7 区间端点梯度如何继续进入样条和段时间
+
+假设前述公式得到区间代价对某个端点执行器状态的梯度
+$\mathbf g_y=\partial C/\partial\mathbf y$，则
+
+$$
+\boxed{
+\mathbf g_\xi=J_{y\xi}^T\mathbf g_y
+}.
+$$
+
+`accumulateFlatGradient()` 用位置/yaw 基函数把该梯度加入多项式系数偏导。若
+端点位于该段归一化位置 $s_k=k/N$，改变段时间还会移动该节点：
+
+$$
+\frac{\partial\boldsymbol\xi(t_k)}{\partial T_i}
+=s_k\dot{\boldsymbol\xi}(t_k).
+$$
+
+因此移动节点贡献为
+
+$$
+\boxed{
+\left.\frac{\partial C}{\partial T_i}\right|_{\mathrm{node}}
+=s_k\mathbf g_\xi^T\dot{\boldsymbol\xi}(t_k)
+}.
+$$
+
+它与第 18.5、18.6 节的显式区间长度贡献相加，再交给
+`propagateCostGradient()`。这一步不能遗漏，否则时间 logits 的解析梯度会与
+有限差分不一致。
+
+### 18.8 总目标中的新增积分项
+
+`ActuatorPenaltyIntegral` 现在包含
+
+```text
+thrust_1, thrust_2, flap_1, flap_2,
+body_rate,
+motor_dynamics, flap_rate, servo_dynamics,
+invalid_mapping
+```
+
+所有分量都先按各自物理尺度归一化，再由同一个 `actuator_weight` 加权进入 Stage B
+目标。`--no-body-rate-constraint` 和 `--no-actuator-dynamics` 只用于消融对比；
+默认两类约束均开启。
+
+需要特别区分“软规划阈值”和“最终物理认证”：平方罚函数不保证优化结果严格低于
+$75\%$ 阈值。若要求规划阈值也严格满足，应提高罚权、使用增广拉格朗日/显式
+不等式约束，或继续增加总时间；当前程序只把完整物理包络作为最终 `feasible`
+判据。
+
+### 18.9 稠密检查与 CSV/绘图输出
+
+`FeasibilityChecker` 除原始幅值外，现以相邻约 `2 ms` 样本检查：
+
+- $\|\boldsymbol\Omega\|$；
+- $|\dot\delta_i|$；
+- 按相同指数一阶模型反算的 $\omega_{i,\mathrm{cmd}}^{\mathrm{req}}$；
+- 按相同指数一阶模型反算的 $\delta_{i,\mathrm{cmd}}^{\mathrm{req}}$。
+
+CSV 新增机体角速度、执行器有限差分速率和反算命令列。绘图脚本在这些列存在时
+额外生成 `*_dynamic_constraints.png`，依次显示机体角速度范数、电机所需命令、
+舵面角速度和舵机所需命令。第一行速率/反算命令没有前一采样点，因此导出
+`NaN` 并在图上自然留空。
+
+### 18.10 默认参数优化结果
+
+为了单独观察新增约束的作用，下面比较“原幅值约束 Stage B”和“幅值 + 机体
+角速度 + 执行器动态 Stage B”。两者总时间均固定为 $1.8\ \mathrm{s}$，参数、
+航点和优化自由度相同：
+
+| 工况/指标 | 仅幅值 | 新增角速度/动态 | 变化 |
+| --- | ---: | ---: | ---: |
+| yaw `0 -> 0`，峰值 $\|\Omega\|$ [rad/s] | 10.111955 | 8.800369 | -12.97% |
+| yaw `0 -> 0`，峰值 $|\dot\delta|$ [rad/s] | 14.924039 | 9.417600 | -36.90% |
+| yaw `0 -> 0`，峰值所需电机命令 [rad/s] | 1908.321598 | 1900.212894 | -0.42% |
+| yaw `0 -> 0`，峰值所需舵机命令 [rad] | 0.897998 | 0.698497 | -22.22% |
+| yaw `0 -> pi`，峰值 $\|\Omega\|$ [rad/s] | 6.701638 | 6.680891 | -0.31% |
+| yaw `0 -> pi`，峰值 $|\dot\delta|$ [rad/s] | 4.330420 | 4.221650 | -2.51% |
+| yaw `0 -> pi`，峰值所需电机命令 [rad/s] | 1911.116071 | 1907.147248 | -0.21% |
+| yaw `0 -> pi`，峰值所需舵机命令 [rad] | 0.647060 | 0.654935 | +1.22% |
+
+yaw `0 -> 0` 中新增约束明显压低角速度、舵面速率和舵机所需命令；yaw
+`0 -> pi` 原本已远低于角速度/舵面速率阈值，新增项主要对电机动态产生较小修正，
+舵机所需命令略增是多目标折中，并不表示每个峰值都保证单调下降。不能比较两次
+运行的“组合目标绝对值”，因为新增运行的目标函数多了四个积分分量。
+
+默认完整约束轨迹相对纯 Stage A 的稠密结果为：
+
+| 工况 | Stage A $\|\Omega\|$ | Stage B $\|\Omega\|$ | Stage A $|\dot\delta|$ | Stage B $|\dot\delta|$ |
+| --- | ---: | ---: | ---: | ---: |
+| yaw `0 -> 0` | 10.616585 | 8.800369 | 17.268658 | 9.417600 |
+| yaw `0 -> pi` | 7.243117 | 6.680891 | 5.810270 | 4.221650 |
+
+两条最终轨迹在完整物理/参考包络下均通过 `2 ms` 稠密检查。yaw `0 -> 0` 的
+$8.800369\ \mathrm{rad/s}$ 仍略高于 $75\%$ 软阈值
+$8.508480\ \mathrm{rad/s}$，但低于完整参考包络 $11.344640\ \mathrm{rad/s}$；
+这正是“软罚函数不等于硬约束”的具体例子。
+
+回归测试中收紧四类阈值以强制所有新增罚项非零，最终五维目标解析梯度相对中心
+有限差分的最大缩放误差为
+
+$$
+\boxed{6.51575\times10^{-7}},
+$$
+
+CTest 仍为 `2/2 passed`。因此新增结果不是用无梯度方法得到的；机体角速度、
+电机动态、舵面速率和舵机动态都已经贯通 L-BFGS 的完整梯度链路。
+
+### 18.11 下一步
+
+第 16.9 节的前两项已经完成。下一步应把这组规划 CSV/样条参考接入
+`paper_control`，并同时记录：
+
+1. 位置、速度、姿态和机体角速度跟踪误差；
+2. 实际电机/舵机命令与状态，以及饱和持续时间；
+3. 规划反算命令与闭环实际命令之间的差异；
+4. 由闭环结果反推的最小可靠 `actuator_margin`。
+
+只有闭环认证通过后，才能把当前“开环动态可实现性”提升为针对该控制器的轨迹
+可跟踪性结论。
+
+### 18.12 当前目标函数与约束的完整汇总
+
+本节集中回答“当前 Stage B 的目标函数和约束到底有哪些”。必须区分四个层次：
+
+1. 真正传给 L-BFGS 的目标函数；
+2. 通过变量参数化和样条构造严格满足的等式/边界；
+3. 进入目标函数的采样软约束；
+4. 优化结束后执行、但不参与求解的稠密认证。
+
+如果不做这一区分，很容易把平方罚函数误称为 NLopt 的硬不等式约束。
+
+#### 18.12.1 优化变量
+
+设轨迹共有 $M$ 段、$K$ 个允许移动的辅助位置航点，当前变量写为
+
+$$
+\boxed{
+\mathbf x=
+[\tau_1,\ldots,\tau_{M-1},
+\mathbf u_1^T,\ldots,\mathbf u_K^T]^T
+}.
+$$
+
+其中 $\tau_i$ 是固定总时间 softmax 的自由 logits，$\mathbf u_k\in[-1,1]^3$
+是辅助点归一化偏移。实际辅助点为
+
+$$
+\mathbf q_k
+=\mathbf q_k^0+\operatorname{diag}(\mathbf h)\mathbf u_k,
+$$
+
+默认
+
+$$
+\mathbf h=[0.5,0.5,0.5]^T\ \mathrm m.
+$$
+
+当前演示轨迹有三段和一个辅助点，因此
+
+$$
+\mathbf x=[\tau_1,\tau_2,u_x,u_y,u_z]^T\in\mathbb R^5.
+$$
+
+yaw 航点、起终点和关键位置航点当前固定，不是 NLopt 变量；样条多项式系数也
+不是外层独立变量，而是由给定航点和分段时间的 minimum-snap/minimum-yaw
+内部问题确定。
+
+#### 18.12.2 当前总目标函数
+
+Stage B 最小化
+
+$$
+\boxed{
+J_B(\mathbf x)
+=\rho_s\frac{J_{\mathrm{smooth}}}{J_{\mathrm{smooth}}^0}
++\rho_gJ_{\mathrm{geometry}}
++\rho_aJ_{\mathrm{constraint}}
+}.
+$$
+
+默认权重为
+
+$$
+\rho_s=1,
+\qquad
+\rho_g=0.05,
+\qquad
+\rho_a=200.
+$$
+
+代码对应 `ActuatorPenaltyConfig` 中的 `smoothness_weight`、`geometry_weight` 和
+`actuator_weight`。
+
+##### 1. 平滑性项
+
+$$
+\boxed{
+J_{\mathrm{smooth}}
+=\int_0^{T_f}\|\mathbf p^{(4)}(t)\|^2\,\mathrm dt
++\lambda_\psi\int_0^{T_f}\ddot\psi^2(t)\,\mathrm dt
+}.
+$$
+
+位置七次样条最小化 snap 能量，yaw 三次样条最小化 yaw acceleration 能量。
+默认 $\lambda_\psi=1$。分母 $J_{\mathrm{smooth}}^0$ 是阶段 B 开始前的阶段 A
+参考平滑能量，在一次优化中固定不变；归一化用于平衡平滑项和无量纲约束罚项的
+数值尺度。
+
+##### 2. 辅助点几何正则项
+
+$$
+\boxed{
+J_{\mathrm{geometry}}=\sum_{k=1}^K\|\mathbf u_k\|^2
+}.
+$$
+
+它抑制辅助点为了降低局部执行器峰值而无必要地移动到搜索区域边界。
+
+##### 3. 约束罚函数项
+
+$$
+\boxed{
+J_{\mathrm{constraint}}
+=J_{T_1}+J_{T_2}+J_{\delta_1}+J_{\delta_2}
++J_\Omega+J_{\mathrm{motor}}
++J_{\dot\delta}+J_{\mathrm{servo}}
++J_{\mathrm{invalid}}
+}.
+$$
+
+代码中的 `ActuatorPenaltyIntegral` 依次保存：
+
+```text
+thrust_1, thrust_2, flap_1, flap_2,
+body_rate,
+motor_dynamics, flap_rate, servo_dynamics,
+invalid_mapping
+```
+
+所有连续违反量使用平方正部
+
+$$
+P(g)=[g]_+^2=[\max(0,g)]^2.
+$$
+
+因此在规划阈值以内罚值和梯度均为零，越界后罚值按归一化违反量的平方增长。
+
+#### 18.12.3 优化内部的采样软约束
+
+默认规划裕度为
+
+$$
+m_a=0.75.
+$$
+
+以下约束均按每段 `samples_per_segment=50` 个区间离散，并作为目标函数罚项，
+不是 NLopt `add_inequality_constraint()` 注册的硬约束。
+
+##### 1. 单电机推力幅值
+
+平坦映射输出 $T_1(t),T_2(t)$，规划区间为
+
+$$
+\boxed{
+T_{\min}\le T_i(t)\le T_{\max}^{p}
+},
+$$
+
+$$
+T_{\min}=c_T\omega_{\min}^2,
+\qquad
+T_{\max}^{p}=c_T(m_a\omega_{\max})^2.
+$$
+
+默认 paper vehicle 参数为
+
+$$
+c_T=1.62\times10^{-6},
+\qquad
+\omega_{\min}=0,
+\qquad
+\omega_{\max}=2500\ \mathrm{rad/s},
+$$
+
+所以
+
+$$
+\omega_{\max}^{p}=1875\ \mathrm{rad/s},
+\qquad
+T_{\max}^{p}\approx5.6953\ \mathrm N.
+$$
+
+这里的原始幅值罚函数定义在单电机推力上；电机动态罚函数则定义在转速和反算
+转速命令上。
+
+##### 2. 舵面偏角幅值
+
+$$
+\boxed{
+|\delta_i(t)|\le\delta_{\max}^{p},
+\qquad
+\delta_{\max}^{p}=m_a\delta_{\max}
+}.
+$$
+
+默认 $\delta_{\max}=1\ \mathrm{rad}$，因此优化阈值为
+
+$$
+\delta_{\max}^{p}=0.75\ \mathrm{rad}.
+$$
+
+##### 3. 机体角速度范数
+
+$$
+\boxed{
+\|\boldsymbol\Omega(t)\|\le\Omega_{\max}^{p},
+\qquad
+\Omega_{\max}^{p}=m_a\Omega_{\max}
+}.
+$$
+
+当前参考包络取论文已展示机动的约 $650\ \mathrm{deg/s}$：
+
+$$
+\Omega_{\max}=11.34464\ \mathrm{rad/s},
+\qquad
+\Omega_{\max}^{p}=8.50848\ \mathrm{rad/s}.
+$$
+
+该数值是参考运动包络，不是厂家认证的机体角速度硬件额定值。
+
+##### 4. 电机一阶动态和所需命令幅值
+
+电机状态取 $y=\omega_i$，一阶模型为
+
+$$
+\tau_m\dot\omega_i
+=\omega_{i,\mathrm{cmd}}-\omega_i,
+\qquad
+\tau_m=0.04\ \mathrm s.
+$$
+
+对相邻规划节点，$a_m=e^{-h/\tau_m}$，反算命令为
+
+$$
+\omega_{i,\mathrm{cmd},k}^{\mathrm{req}}
+=\frac{\omega_{i,k+1}-a_m\omega_{i,k}}{1-a_m}.
+$$
+
+软约束为
+
+$$
+\boxed{
+\omega_{\min}
+\le\omega_{i,\mathrm{cmd},k}^{\mathrm{req}}
+\le m_a\omega_{\max}
+}.
+$$
+
+默认即
+
+$$
+0\le\omega_{i,\mathrm{cmd},k}^{\mathrm{req}}
+\le1875\ \mathrm{rad/s}.
+$$
+
+当前没有另外设置 $|\dot\omega_i|$、$|\dot T_i|$ 的独立上限；电机变化能力由
+一阶时间常数和所需命令幅值共同描述。
+
+##### 5. 舵面角速度
+
+区间有限差分为
+
+$$
+\dot\delta_{i,k}\approx
+\frac{\delta_{i,k+1}-\delta_{i,k}}{h},
+$$
+
+对应软约束
+
+$$
+\boxed{
+|\dot\delta_{i,k}|
+\le\dot\delta_{\max}^{p},
+\qquad
+\dot\delta_{\max}^{p}=m_a\dot\delta_{\max}
+}.
+$$
+
+默认 $\dot\delta_{\max}=25\ \mathrm{rad/s}$，所以规划阈值为
+
+$$
+\dot\delta_{\max}^{p}=18.75\ \mathrm{rad/s}.
+$$
+
+##### 6. 舵机一阶动态和所需命令幅值
+
+舵机状态取 $y=\delta_i$：
+
+$$
+\tau_s\dot\delta_i
+=\delta_{i,\mathrm{cmd}}-\delta_i,
+\qquad
+\tau_s=0.03\ \mathrm s.
+$$
+
+令 $a_s=e^{-h/\tau_s}$，反算命令为
+
+$$
+\delta_{i,\mathrm{cmd},k}^{\mathrm{req}}
+=\frac{\delta_{i,k+1}-a_s\delta_{i,k}}{1-a_s}.
+$$
+
+软约束为
+
+$$
+\boxed{
+|\delta_{i,\mathrm{cmd},k}^{\mathrm{req}}|
+\le m_a\delta_{\max}=0.75\ \mathrm{rad}
+}.
+$$
+
+舵面速率和舵机命令两项同时存在：前者限制实际状态变化速度，后者限制一阶动态
+为了实现该变化所需的输入幅值。
+
+##### 7. 无效平坦映射
+
+以下情况进入 `invalid_mapping`：
+
+- 不存在合法的非负总推力姿态分支；
+- 出现负单电机推力；
+- 舵面分配矩阵接近奇异；
+- 映射结果包含非有限值。
+
+默认无效映射罚值为 `10`。该区域通常伴随分支或有效域边界，不具有可供 L-BFGS
+使用的全局光滑导数；当前代码把无效罚值作为局部屏障，而不伪造穿过无效域的
+梯度。
+
+#### 18.12.4 由构造严格满足的约束
+
+下面这些不是平方罚项，而是由变量映射、NLopt box bounds 或样条方程严格满足。
+
+##### 1. 固定总时间和正分段时间
+
+令最后一个固定 logit 为 $z_M=0$，其余 $z_i=\tau_i$：
+
+$$
+T_i=T_f\frac{e^{z_i}}{\sum_{j=1}^M e^{z_j}}.
+$$
+
+因此对每次迭代都有
+
+$$
+\boxed{
+T_i>0,
+\qquad
+\sum_{i=1}^M T_i=T_f
+}.
+$$
+
+当前演示总时间固定为 $T_f=1.8\ \mathrm s$。
+
+##### 2. 时间 logits 边界
+
+NLopt box bounds 为
+
+$$
+\boxed{-5\le\tau_i\le5}.
+$$
+
+它限制不同分段时间比例的极端程度；物理分段时间本身仍由 softmax 保证正值与
+定和。
+
+##### 3. 辅助点搜索边界
+
+$$
+\boxed{-1\le u_{k,x},u_{k,y},u_{k,z}\le1}.
+$$
+
+默认 $\mathbf h=[0.5,0.5,0.5]^T\ \mathrm m$，相当于每个可移动辅助点满足
+
+$$
+|q_{k,j}-q_{k,j}^0|\le0.5\ \mathrm m.
+$$
+
+##### 4. 航点插值
+
+位置/yaw 样条严格经过给定的：
+
+- 起点；
+- 固定关键航点；
+- 当前优化得到的辅助位置航点；
+- 终点；
+- 固定 yaw 航点。
+
+##### 5. 边界导数与样条连续性
+
+默认 `BoundaryConditions` 为零，因此位置七次样条满足
+
+$$
+\boxed{
+\mathbf v(0)=\mathbf v(T_f)=\mathbf0,
+\quad
+\mathbf a(0)=\mathbf a(T_f)=\mathbf0,
+\quad
+\mathbf j(0)=\mathbf j(T_f)=\mathbf0
+}.
+$$
+
+yaw 三次样条使用与其阶次相符的零首末 yaw rate：
+
+$$
+\boxed{
+\dot\psi(0)=\dot\psi(T_f)=0
+}.
+$$
+
+各段内部位置及所需导数连续性、yaw 及 yaw rate 连续性由样条求解器保证。
+
+#### 18.12.5 优化后 `2 ms` 稠密认证
+
+L-BFGS 结束后，`FeasibilityChecker` 默认按约 $2\ \mathrm{ms}$ 采样，并额外
+插入所有样条连接点。默认构造使用 `actuator_margin=1`，即检查完整包络：
+
+$$
+\boxed{0\le\omega_i\le2500\ \mathrm{rad/s}},
+$$
+
+$$
+\boxed{|\delta_i|\le1.0\ \mathrm{rad}},
+$$
+
+$$
+\boxed{\|\boldsymbol\Omega\|\le11.34464\ \mathrm{rad/s}},
+$$
+
+$$
+\boxed{|\dot\delta_i|\le25\ \mathrm{rad/s}},
+$$
+
+$$
+\boxed{
+0\le\omega_{i,\mathrm{cmd}}^{\mathrm{req}}
+\le2500\ \mathrm{rad/s}
+},
+$$
+
+$$
+\boxed{
+|\delta_{i,\mathrm{cmd}}^{\mathrm{req}}|
+\le1.0\ \mathrm{rad}
+}.
+$$
+
+稠密检查还要求：
+
+- 每个采样点的平坦映射有效；
+- 姿态分支连续；
+- 毫秒级相邻姿态没有超过 $0.5\ \mathrm{rad}$ 的异常跳变。
+
+这个 `feasible` 判定发生在优化之后，不会向 L-BFGS 返回约束 Jacobian，也不会
+把违反结果自动转成 NLopt 硬约束。它是独立的开环认证层。
+
+#### 18.12.6 当前没有包含的约束
+
+当前 Stage B 尚未加入：
+
+- 障碍物、碰撞和空间走廊约束；
+- 速度、加速度和 jerk 的显式上限；
+- 倾角约束；
+- 机体角加速度和三轴力矩上限；
+- 独立的电机转速变化率或单电机推力变化率上限；
+- 电池电压、功率和总能量约束；
+- `paper_control` 闭环跟踪误差、实际饱和量和饱和持续时间约束。
+
+因此当前优化问题最准确的表述是：
+
+> NLopt L-BFGS 只直接处理时间 logits 和辅助点的 box bounds；固定总时间、正段
+> 时间、航点插值和边界条件由参数化/样条严格保证；执行器幅值、机体角速度、
+> 舵面速率和一阶动态可实现性是可微采样软罚函数；优化结束后再用完整包络执行
+> 独立的稠密开环认证。
+
+---
+
+## 19. 测试 3：无固定总时间的多航点时空联合优化
+
+测试 3 把第 16.4 节推荐形式落实为一个独立的 hover-to-hover 场景。原固定总时间
+Stage B 仍然保留作为对照；新增接口 `optimizeJoint()` 同时优化所有分段时间和
+多个中间自由位置航点，并按第 16.5 节同时保留高层约束与当前构型的真实执行器
+约束。
+
+### 19.1 场景与未施加的约束
+
+测试的两个 hover 点为
+
+$$
+\mathbf p_0=[0,0,-10]^T\ \mathrm m,
+\qquad
+\mathbf p_f=[15,0,-10]^T\ \mathrm m.
+$$
+
+相比前两项测试的 $6\ \mathrm m$ 距离，本测试延长到 $15\ \mathrm m$。在直线
+初值上放置三个中间点：
+
+$$
+\mathbf q_1^0=[3.75,0,-10]^T,
+\quad
+\mathbf q_2^0=[7.50,0,-10]^T,
+\quad
+\mathbf q_3^0=[11.25,0,-10]^T.
+$$
+
+因此共有四段。测试仍包含两种固定 yaw 航点序列：
+
+$$
+\text{yaw 0 -> 0}:\quad
+[0,0,0,0,0],
+$$
+
+$$
+\text{yaw 0 -> pi}:\quad
+[0,\pi/4,\pi/2,3\pi/4,\pi].
+$$
+
+起终端使用默认零速度、零加速度和零 jerk，因而是 hover-to-hover 边界。三个
+中间 yaw 值暂时固定，测试 3 的自由航点只指位置自由度。
+
+本测试明确没有：
+
+- 固定总时间等式约束；
+- 障碍物约束；
+- 连续时间安全走廊约束。
+
+中间点仍有有限 box bounds：默认相对标称位置允许
+
+$$
+\Delta x\in[-2,2]\ \mathrm m,
+\quad
+\Delta y\in[-3,3]\ \mathrm m,
+\quad
+\Delta z\in[-2,2]\ \mathrm m.
+$$
+
+这只是防止无界搜索的航点变量边界，不是约束整条轨迹必须位于某个安全走廊。
+
+### 19.2 自由时间与航点的 13 维参数化
+
+设初始每段时间为 $T_i^0=1\ \mathrm s$。测试 3 不再使用固定总时间 softmax，
+而对每段引入独立 log-duration：
+
+$$
+\boxed{
+T_i=T_i^0e^{\eta_i},
+\qquad i=1,\ldots,4
+}.
+$$
+
+这样每段始终满足 $T_i>0$，但
+
+$$
+T_f=\sum_{i=1}^4T_i
+$$
+
+是优化结果，不再固定为初始 $4\ \mathrm s$。默认 box bound 为
+
+$$
+-1.5\le\eta_i\le1.5.
+$$
+
+三个辅助点用归一化变量 $\mathbf u_k\in[-1,1]^3$ 表示，所以完整变量为
+
+$$
+\boxed{
+\mathbf x=
+[\eta_1,\eta_2,\eta_3,\eta_4,
+\mathbf u_1^T,\mathbf u_2^T,\mathbf u_3^T]^T
+\in\mathbb R^{13}
+}.
+$$
+
+### 19.3 测试 3 的目标函数
+
+联合目标为
+
+$$
+\boxed{
+J_3=
+\rho_s\frac{J_{\mathrm{smooth}}}{J_{\mathrm{smooth}}^0}
++\rho_T\sum_{i=1}^4T_i
++\rho_g\sum_{k=1}^3\|\mathbf u_k\|^2
++\rho_cJ_{\mathrm{constraint}}
+}.
+$$
+
+默认权重为
+
+$$
+\rho_s=1,
+\qquad
+\rho_T=0.5,
+\qquad
+\rho_g=0.02,
+\qquad
+\rho_c=200.
+$$
+
+其中平滑项仍为位置 snap 能量加 yaw acceleration 能量。新增
+$\rho_TT_f$ 很关键：取消固定总时间后，如果没有时间代价，优化器可以不断拉长
+轨迹以把导数和约束罚值压向零；时间项使平滑性、可行性和完成时间形成有限折中。
+
+### 19.4 同时保留的高层约束和执行器约束
+
+测试 3 设置 `enable_high_level_constraints=true`。默认 $75\%$ 规划裕度下，高层
+采样软约束包括：
+
+$$
+\boxed{\|\mathbf v\|\le6.0\ \mathrm{m/s}},
+$$
+
+$$
+\boxed{\|\boldsymbol\Omega\|\le8.50848\ \mathrm{rad/s}},
+$$
+
+$$
+\boxed{0\le T\le11.390625\ \mathrm N}.
+$$
+
+这里速度完整参考包络为 $8\ \mathrm{m/s}$；总推力阈值由两个电机各自的
+$1875\ \mathrm{rad/s}$ 规划转速阈值得到：
+
+$$
+T_{\max}^{p}=2c_T(1875)^2=11.390625\ \mathrm N.
+$$
+
+高层约束之外，以下真实执行器软约束全部保留：
+
+- $T_1,T_2$ 单电机推力幅值；
+- $\delta_1,\delta_2$ 舵面偏角幅值；
+- 电机一阶动态反算命令幅值；
+- 舵面有限差分角速度；
+- 舵机一阶动态反算命令幅值；
+- 无效映射屏障。
+
+所以测试 3 实际实现的是
+
+$$
+\boxed{
+(\|\mathbf v\|,T,\|\boldsymbol\Omega\|)\text{ 高层约束}
++(T_1,T_2,\delta_1,\delta_2)\text{ 执行器幅值约束}
++\text{执行器速率/动态约束}
+}.
+$$
+
+### 19.5 自由时间梯度与固定总时间版本的区别
+
+设样条反向传播后得到物理段时间梯度
+
+$$
+g_{T_i}
+=\frac{\partial}{\partial T_i}
+\left[
+\rho_s\frac{J_{\mathrm{smooth}}}{J_{\mathrm{smooth}}^0}
++\rho_cJ_{\mathrm{constraint}}
+\right].
+$$
+
+加入时间代价后为
+
+$$
+\frac{\partial J_3}{\partial T_i}=g_{T_i}+\rho_T.
+$$
+
+由 $T_i=T_i^0e^{\eta_i}$，
+
+$$
+\frac{\partial T_i}{\partial\eta_i}=T_i,
+\qquad
+\frac{\partial T_i}{\partial\eta_j}=0\quad(i\ne j),
+$$
+
+所以传给 L-BFGS 的时间变量梯度为
+
+$$
+\boxed{
+\frac{\partial J_3}{\partial\eta_i}
+=T_i(g_{T_i}+\rho_T)
+}.
+$$
+
+它与固定总时间版本的关键区别是：不再减去 softmax 的时间梯度加权平均值。每段
+可以独立变长或缩短，总时间也随之改变。
+
+### 19.6 高层速度和总推力梯度
+
+速度罚函数使用
+
+$$
+p_v=
+\left[
+\frac{\|\mathbf v\|-v_p}{v_p}
+\right]_+^2.
+$$
+
+激活时
+
+$$
+\boxed{
+\frac{\partial p_v}{\partial\mathbf v}
+=\frac{2g_v}{v_p}
+\frac{\mathbf v}{\|\mathbf v\|}
+}.
+$$
+
+它直接写入 15 维平坦梯度的 velocity 三维块。
+
+总推力满足
+
+$$
+T=T_1+T_2.
+$$
+
+若 $p_T(T)$ 是总推力上下界罚函数，则
+
+$$
+\boxed{
+\frac{\partial p_T}{\partial T_1}
+=\frac{\partial p_T}{\partial T_2}
+=\frac{\partial p_T}{\partial T}
+}.
+$$
+
+因此代码把同一个总推力罚函数导数同时加到执行器 Jacobian 的前两行，不需要
+额外构造一套 collective-thrust AutoDiff 映射。
+
+### 19.7 优化结果
+
+两种 yaw 的初始总时间均为 $4\ \mathrm s$。优化结果如下：
+
+| 工况 | 初始总时间 [s] | 优化总时间 [s] | 目标评估数 | 完整包络认证 |
+| --- | ---: | ---: | ---: | --- |
+| yaw `0 -> 0` | 4.000000 | 3.921840 | 68 | 通过 |
+| yaw `0 -> pi` | 4.000000 | 3.921932 | 87 | 通过 |
+
+分段时间为：
+
+| 工况 | $T_1$ | $T_2$ | $T_3$ | $T_4$ |
+| --- | ---: | ---: | ---: | ---: |
+| yaw `0 -> 0` | 1.268790 | 0.692229 | 0.690396 | 1.270425 |
+| yaw `0 -> pi` | 1.271163 | 0.688954 | 0.692869 | 1.268946 |
+
+首末段更长、中间两段更短，原因是 hover 边界需要在首段完成加速、末段完成减速，
+而中间段可保持接近约束边界的巡航速度。
+
+自由航点结果为：
+
+| 工况 | 航点 1 [m] | 航点 2 [m] | 航点 3 [m] |
+| --- | --- | --- | --- |
+| yaw `0 -> 0` | `[3.373901, 0, -10.000059]` | `[7.500911, 0, -10.000113]` | `[11.617106, 0, -10.000089]` |
+| yaw `0 -> pi` | `[3.386991, 0, -9.999555]` | `[7.494676, 0.000021, -9.999510]` | `[11.625403, 0.000039, -9.999842]` |
+
+三个点确实参与优化，但 y/z 变化接近零。这不是自由度失效，而是当前无障碍、
+无走廊、无风且起终点关于 x 轴对称，目标函数没有让轨迹横向或竖向绕行的收益。
+优化主要重新分配 x 方向航点和段时间。
+
+### 19.8 稠密指标对比
+
+| 工况/指标 | 初始直线猜测 | 联合优化 |
+| --- | ---: | ---: |
+| yaw `0 -> 0`，峰值速度 [m/s] | 7.876371 | 6.049621 |
+| yaw `0 -> 0`，峰值总推力 [N] | 11.586775 | 8.473927 |
+| yaw `0 -> 0`，峰值机体角速度 [rad/s] | 10.324432 | 3.798220 |
+| yaw `0 -> 0`，峰值转速 [rad/s] | 1891.075113 | 1617.222763 |
+| yaw `0 -> 0`，峰值舵偏 [rad] | 0.769022 | 0.386757 |
+| yaw `0 -> 0`，峰值舵速 [rad/s] | 185.369950 | 1.662690 |
+| yaw `0 -> pi`，峰值速度 [m/s] | 7.876371 | 6.049637 |
+| yaw `0 -> pi`，峰值总推力 [N] | 11.595620 | 8.475417 |
+| yaw `0 -> pi`，峰值机体角速度 [rad/s] | 11.179657 | 2.783937 |
+| yaw `0 -> pi`，峰值转速 [rad/s] | 1913.194024 | 1627.637959 |
+| yaw `0 -> pi`，峰值舵偏 [rad] | 0.980739 | 0.356700 |
+| yaw `0 -> pi`，峰值舵速 [rad/s] | 25.884049 | 0.538798 |
+
+两个初始猜测均未通过完整认证；优化后两条轨迹均通过。yaw `0 -> pi` 初值还有
+47 个无效执行器映射采样，优化结果为 0 个。
+
+最终速度约 $6.05\ \mathrm{m/s}$，略高于 $75\%$ 规划软阈值
+$6.0\ \mathrm{m/s}$，但低于完整参考包络 $8\ \mathrm{m/s}$。如果要求严格不超过
+$6\ \mathrm{m/s}$，仍需增大罚权或把速度改成显式不等式硬约束。
+
+### 19.9 梯度和回归验证
+
+`test_joint_optimizer` 分别对 yaw `0 -> 0` 和 `0 -> pi` 的全部 13 个变量做中心
+有限差分。检查覆盖：
+
+- 四个独立 log-duration 及时间代价；
+- 三个自由航点的九个位置变量；
+- 速度和总推力高层罚函数；
+- 机体角速度、原执行器幅值、速率和动态罚函数；
+- 样条反向传播和自由时间指数映射。
+
+当前最大缩放梯度误差为
+
+$$
+\boxed{1.73378\times10^{-8}},
+$$
+
+完整 CTest 为 `3/3 passed`。
+
+## 20. 使用 `paper_control` 控制器跟踪测试 3 轨迹
+
+### 20.1 闭环连接原则
+
+测试 3 输出的是平坦输出参考，而不是应该直接施加到仿真模型的执行器命令。闭环
+仿真只读取
+
+$$
+\boxed{
+\mathbf p_d,\ \mathbf v_d,\ \mathbf a_d,\ \mathbf j_d,
+\ \psi_d,\ \dot\psi_d
+}
+$$
+
+并继续使用项目中已经复现的 `paper_control` 控制链：
+
+$$
+\begin{aligned}
+(\mathbf p_d,\mathbf v_d,\mathbf a_d)
+&\xrightarrow{\text{位置/速度 PD}}
+\mathbf a_c \\
+&\xrightarrow{\text{线加速度 INDI}}
+\mathbf f_c^i \\
+&\xrightarrow{\text{全局平坦变换}}
+(q_c,T_c) \\
+(q_c,\mathbf j_d,\psi_d,\dot\psi_d)
+&\xrightarrow{\text{姿态 PD + 角速度前馈}}
+\dot{\boldsymbol\omega}_c \\
+&\xrightarrow{\text{角加速度 INDI}}
+\mathbf m_c \\
+(T_c,\mathbf m_c)
+&\xrightarrow{\text{控制分配}}
+(\omega_{1,c},\omega_{2,c},\delta_{1,c},\delta_{2,c}).
+\end{aligned}
+$$
+
+因此规划 CSV 中的 `omega*_pred`、`delta*_pred` 仍只是规划阶段的开环可行性
+预测。闭环仿真不读取这些列作为前馈执行器命令；电机和舵机命令由控制器根据
+实际状态误差在线重新计算。这保持了“规划器给参考、控制器负责抗模型误差”的
+正确分层。
+
+### 20.2 CSV 连续时间接口
+
+新增 `trajectory/planning_csv.py`，将规划器 CSV 包装为 `main_sim.py` 所需的
+统一 `sample(t)` 接口。必需列为：
+
+```text
+t
+px py pz
+vx vy vz
+ax ay az
+jx jy jz
+yaw yaw_rate yaw_acceleration
+```
+
+规划稠密检查以不超过 $2\ \mathrm{ms}$ 的间隔输出，而闭环控制频率为
+$500\ \mathrm{Hz}$，周期同样为 $2\ \mathrm{ms}$。由于各段会显式插入真实样条
+连接点，连接点和相邻规则采样有时只相差约 $0.1\ \mathrm{ms}$。如果直接用这些
+相邻行的有限精度十进制数重新构造七次 Hermite 多项式，高阶系数会被极短时间
+间隔放大，产生原轨迹不存在的 jerk 尖峰。
+
+因此当前实现对 CSV 已经给出的每个平坦量分别做线性时间插值：
+
+$$
+y(t)=(1-\lambda)y_k+\lambda y_{k+1},
+\qquad
+\lambda=\frac{t-t_k}{t_{k+1}-t_k}.
+$$
+
+这里 $y$ 分别取 $\mathbf p,\mathbf v,\mathbf a,\mathbf j,\psi,\dot\psi$。它们在
+连续时间意义下不是严格由同一个插值多项式逐级求导得到，但最大插值区间只有
+$2\ \mathrm{ms}$，比在极短连接点区间重构高阶多项式更稳健。若以后需要更高
+精度，推荐规划器直接导出每一段的多项式系数和持续时间，而不是从稠密 CSV
+反推系数。
+
+### 20.3 初值和末端悬停
+
+两条规划轨迹都满足起点 hover 条件：
+
+$$
+\mathbf v_d(0)=\mathbf a_d(0)=\mathbf j_d(0)=\mathbf 0.
+$$
+
+闭环仿真使用 `initial_state_mode="hover"`，在规划起点位置和 yaw 下初始化真实
+悬停姿态、电机转速、舵面配平以及 INDI 滤波器状态。因此结果不包含从地面起飞
+到规划起点的额外瞬态。
+
+默认在规划时间 $T_f$ 后增加 $1\ \mathrm s$ 末端保持：
+
+$$
+\mathbf p_d(t)=\mathbf p_d(T_f),\qquad
+\mathbf v_d=\mathbf a_d=\mathbf j_d=\mathbf0,
+\qquad t\ge T_f.
+$$
+
+这 $1\ \mathrm s$ 不属于优化所得总时间，只用于观察无人机到达末端 hover 后的
+误差收敛。统计中“规划段 RMS/最大误差”只使用 $0\le t\le T_f$，而“最终误差”
+取末端保持结束时的误差。
+
+### 20.4 运行命令
+
+```bash
+python main_sim.py --trajectory planning-yaw0 \
+  --log planning/output/joint_hover_yaw0_tracking.npz \
+  --hold-duration 1.0 --no-show
+
+python main_sim.py --trajectory planning-yaw-pi \
+  --log planning/output/joint_hover_yaw_pi_tracking.npz \
+  --hold-duration 1.0 --no-show
+
+python planning/scripts/plot_tracking_results.py
+```
+
+任意同格式 CSV 可以通过通用入口运行：
+
+```bash
+python main_sim.py --trajectory planning-csv \
+  --trajectory-csv planning/output/my_trajectory.csv \
+  --log planning/output/my_trajectory_tracking.npz \
+  --hold-duration 1.0 --no-show
+```
+
+### 20.5 闭环跟踪结果
+
+两条轨迹均完成有限、稳定的六自由度闭环仿真。规划段结果为：
+
+| 指标 | yaw `0 -> 0` | yaw `0 -> pi` |
+| --- | ---: | ---: |
+| 规划时间 [s] | 3.921840 | 3.921932 |
+| 位置 RMS 误差 [m] | 0.2021 | 0.2371 |
+| 位置最大误差 [m] | 0.3811 | 0.4854 |
+| 末端保持结束位置误差 [m] | 0.0607 | 0.2031 |
+| 速度 RMS 误差 [m/s] | 0.4022 | 0.5730 |
+| 速度最大误差 [m/s] | 0.8824 | 1.4026 |
+| yaw RMS 误差 [deg] | 近似 0 | 1.1715 |
+| yaw 最大误差 [deg] | 近似 0 | 4.0497 |
+| 末端 yaw 误差 [deg] | 0 | 0.0029 |
+
+yaw `0 -> 0` 工况始终保持完全对称，仿真中的 yaw 数值误差在
+$10^{-13}\ \mathrm{deg}$ 量级。yaw `0 -> pi` 工况需要差动推力和非对称舵面动作，
+同时引入横向和高度耦合，因此位置、速度误差高于不变 yaw 工况。它仍能在规划段
+内把 yaw 最大误差保持在约 $4.05^\circ$，并在末端基本准确到达
+$180^\circ$。
+
+### 20.6 执行器和机体角速度结果
+
+| 指标 | yaw `0 -> 0` | yaw `0 -> pi` | `config.py` 物理上限/包络 |
+| --- | ---: | ---: | ---: |
+| 实际最大电机转速 [rad/s] | 1670.43 | 1643.74 | 2500 |
+| 最大电机指令 [rad/s] | 1677.69 | 1649.02 | 2500 |
+| 实际最大绝对舵偏 [deg] | 22.71 | 30.00 | 57.30 |
+| 最大绝对舵面指令 [deg] | 23.32 | 30.74 | 57.30 |
+| 实际最大机体角速度 [rad/s] | 3.5193 | 4.7625 | 11.3446 参考包络 |
+| 最大前馈角速度 [rad/s] | 2.9340 | 3.4333 | 11.3446 参考包络 |
+
+两组实际执行器和控制器命令均未触及 `config.py` 的物理限幅。实际机体角速度峰值
+高于平坦前馈角速度峰值，是姿态反馈和 INDI 为纠正跟踪误差产生的闭环动作，但仍
+显著低于当前 $650\ \mathrm{deg/s}$ 参考包络。
+
+这里还应注意：当前规划 CSV 使用默认 `paper_vehicle` 参数，即
+$m=0.68\ \mathrm{kg}$、$c_T=1.62\times10^{-6}$；闭环仿真使用 `config.py` 的
+$m=0.7\ \mathrm{kg}$、$c_T=1.8\times10^{-6}$。闭环仍成功跟踪说明控制器可以
+补偿这部分参数差异，但开环预测峰值与闭环真实执行器峰值不应直接逐点等同。如果
+要进行严格同模型对照，应使用 `--simulation-vehicle` 重新规划后再运行闭环。
+
+### 20.7 输出文件
+
+闭环日志为：
+
+```text
+planning/output/joint_hover_yaw0_tracking.npz
+planning/output/joint_hover_yaw_pi_tracking.npz
+```
+
+除原有状态、参考和执行器记录外，日志新增：
+
+```text
+rotor_speed_command
+flap_command_deg
+planned_duration
+trajectory_source
+```
+
+绘图结果为：
+
+```text
+planning/output/figures/joint_hover_closed_loop_overview.png
+planning/output/figures/joint_hover_closed_loop_actuators.png
+```
+
+第一张图对比空间轨迹、位置误差、速度和 yaw；第二张图对比电机实际/指令、舵面
+实际/指令以及机体角速度。竖直虚线表示优化轨迹结束，虚线右侧为额外的 $1\ \mathrm s$
+末端悬停，而不是规划总时间的一部分。

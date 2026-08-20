@@ -16,6 +16,7 @@ set(SPLINE_TRAJECTORY_ROOT
 add_library(tailsitter_planning
     src/flat_output_trajectory.cpp
     src/time_allocation.cpp
+    src/actuator_penalty_optimizer.cpp
     src/tailsitter_flatness.cpp
     src/feasibility_checker.cpp
     src/time_scaler.cpp)
@@ -32,8 +33,21 @@ target_compile_options(tailsitter_planning PRIVATE -Wall -Wextra -Wpedantic)
 add_executable(generate_simple_trajectory apps/generate_simple_trajectory.cpp)
 target_link_libraries(generate_simple_trajectory PRIVATE tailsitter_planning)
 
+add_executable(generate_stage_b_trajectory apps/generate_stage_b_trajectory.cpp)
+target_link_libraries(generate_stage_b_trajectory PRIVATE tailsitter_planning)
+
+add_executable(generate_joint_hover_trajectory apps/generate_joint_hover_trajectory.cpp)
+target_link_libraries(generate_joint_hover_trajectory PRIVATE tailsitter_planning)
+
 enable_testing()
 add_executable(test_stage_a tests/test_stage_a.cpp)
 target_link_libraries(test_stage_a PRIVATE tailsitter_planning)
 add_test(NAME stage_a COMMAND test_stage_a)
 
+add_executable(test_stage_b tests/test_stage_b.cpp)
+target_link_libraries(test_stage_b PRIVATE tailsitter_planning)
+add_test(NAME stage_b COMMAND test_stage_b)
+
+add_executable(test_joint_optimizer tests/test_joint_optimizer.cpp)
+target_link_libraries(test_joint_optimizer PRIVATE tailsitter_planning)
+add_test(NAME joint_optimizer COMMAND test_joint_optimizer)
