@@ -59,6 +59,28 @@ int main()
     if (allocation.final_cost > allocation.initial_cost * (1.0 + 1e-8))
         return fail("time allocation increased smoothness energy");
 
+    // Test 3 control: fixed 15 m straight line, five fixed waypoints and four
+    // softmax durations. Only the time ratio is optimized; no waypoint or
+    // actuator-penalty variable enters this Stage A objective.
+    planning::FlatOutputTrajectory::PositionMatrix straight_positions(5, 3);
+    planning::FlatOutputTrajectory::YawMatrix straight_yaws(5, 1);
+    for (int waypoint = 0; waypoint < 5; ++waypoint)
+    {
+        const double fraction = static_cast<double>(waypoint) / 4.0;
+        straight_positions.row(waypoint) << 15.0 * fraction, 0.0, -10.0;
+        straight_yaws(waypoint, 0) = fraction * 3.14159265358979323846;
+    }
+    const auto straight_allocation = allocator.optimize(
+        4.0, straight_positions, straight_yaws);
+    if (straight_allocation.durations.size() != 4 ||
+        !near(std::accumulate(straight_allocation.durations.begin(),
+                              straight_allocation.durations.end(), 0.0),
+              4.0, 1e-12))
+        return fail("five-waypoint softmax durations do not preserve total time");
+    if (straight_allocation.final_cost >
+        straight_allocation.initial_cost * (1.0 + 1e-8))
+        return fail("five-waypoint time allocation increased smoothness energy");
+
     planning::FlatOutputTrajectory trajectory;
     trajectory.update(allocation.durations, positions, yaws);
     const auto start = trajectory.sample(0.0);

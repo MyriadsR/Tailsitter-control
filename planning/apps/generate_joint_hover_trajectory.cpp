@@ -56,7 +56,7 @@ void writeCsv(const std::filesystem::path& path,
               "collective_thrust,body_rate_x,body_rate_y,body_rate_z,body_rate_norm,"
               "rotor_rate_1,rotor_rate_2,flap_rate_1,flap_rate_2,"
               "omega_cmd_req_1,omega_cmd_req_2,delta_cmd_req_1,delta_cmd_req_2\n";
-    stream << std::setprecision(12);
+    stream << std::setprecision(17);
 
     bool previous_valid = false;
     planning::ActuatorPrediction previous_prediction;
@@ -155,6 +155,7 @@ int main(int argc, char** argv)
     {
         bool yaw_pi = false;
         bool simulation_vehicle = false;
+        bool enforce_velocity_constraint = true;
         double distance = 15.0;
         double initial_total_time = 4.0;
         planning::ActuatorPenaltyConfig config;
@@ -175,6 +176,8 @@ int main(int argc, char** argv)
             };
             if (argument == "--yaw-pi") yaw_pi = true;
             else if (argument == "--simulation-vehicle") simulation_vehicle = true;
+            else if (argument == "--no-velocity-constraint")
+                enforce_velocity_constraint = false;
             else if (argument == "--distance") distance = parseDouble(next("--distance"), "--distance");
             else if (argument == "--initial-total-time") initial_total_time = parseDouble(next("--initial-total-time"), "--initial-total-time");
             else if (argument == "--time-weight") config.time_weight = parseDouble(next("--time-weight"), "--time-weight");
@@ -189,7 +192,8 @@ int main(int argc, char** argv)
             else
             {
                 std::cerr << "usage: generate_joint_hover_trajectory [--yaw-pi] "
-                             "[--simulation-vehicle] [--distance M] "
+                             "[--simulation-vehicle] [--no-velocity-constraint] "
+                             "[--distance M] "
                              "[--initial-total-time S] [--time-weight W] "
                              "[--actuator-margin M] [--actuator-weight W] "
                              "[--geometry-weight W] [--free-time-log-bound B] "
@@ -200,6 +204,7 @@ int main(int argc, char** argv)
         }
         if (!(distance > 0.0) || !(initial_total_time > 0.0))
             throw std::invalid_argument("distance and initial total time must be positive");
+        config.enable_velocity_constraint = enforce_velocity_constraint;
 
         constexpr int waypoint_count = 5;
         constexpr int segment_count = waypoint_count - 1;
@@ -229,7 +234,8 @@ int main(int argc, char** argv)
         planning::FlatOutputTrajectory optimized_trajectory;
         optimized_trajectory.update(result.durations, result.position_waypoints, yaws);
         planning::FeasibilityChecker checker(
-            planning::TailsitterFlatness(parameters), 0.002);
+            planning::TailsitterFlatness(parameters), 0.002, 1.0,
+            enforce_velocity_constraint);
         const auto initial_report = checker.check(initial_trajectory, true);
         const auto optimized_report = checker.check(optimized_trajectory, true);
         writeCsv(baseline_output, initial_trajectory, initial_report, parameters);
@@ -241,6 +247,8 @@ int main(int argc, char** argv)
                   << "distance: " << distance << " m, variables: 13 "
                      "(4 log-durations + 3 free 3D waypoints)\n"
                   << "fixed total time: no, safety corridor: no\n"
+                  << "velocity constraint: "
+                  << (enforce_velocity_constraint ? "enabled" : "disabled") << '\n'
                   << "time weight: " << config.time_weight
                   << ", actuator weight: " << config.actuator_weight
                   << ", margin: " << config.actuator_margin << '\n'

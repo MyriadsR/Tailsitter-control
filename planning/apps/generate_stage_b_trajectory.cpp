@@ -31,7 +31,7 @@ void writeCsv(const std::filesystem::path& path,
               "rotor_rate_1,rotor_rate_2,"
               "flap_rate_1,flap_rate_2,omega_cmd_req_1,omega_cmd_req_2,"
               "delta_cmd_req_1,delta_cmd_req_2\n";
-    stream << std::setprecision(12);
+    stream << std::setprecision(17);
     bool previous_valid = false;
     planning::ActuatorPrediction previous_prediction;
     for (const auto& prediction : report.predictions)

@@ -99,6 +99,32 @@ int main()
          positions.row(waypoint_count - 1).transpose()).norm() > 1e-8)
         return fail("joint trajectory hover endpoint mismatch");
 
+    planning::ActuatorPenaltyConfig no_velocity_config = config;
+    no_velocity_config.enable_velocity_constraint = false;
+    no_velocity_config.max_evaluations = 2;
+    planning::ActuatorPenaltyOptimizer no_velocity_optimizer(
+        planning::TailsitterFlatness(planning::VehicleParameters::paperVehicle()),
+        no_velocity_config);
+    const auto no_velocity_result = no_velocity_optimizer.optimizeJoint(
+        initial_durations, positions, yaws, free_waypoints);
+    if (std::abs(no_velocity_result.initial_terms.actuator.velocity) > 1e-15 ||
+        !(no_velocity_result.initial_terms.actuator.collective_thrust > 0.0))
+        return fail("disabling velocity also disabled or retained the wrong high-level term");
+
+    auto low_speed_parameters = planning::VehicleParameters::paperVehicle();
+    low_speed_parameters.velocity_max = 0.1;
+    planning::FlatOutputTrajectory speed_only_trajectory;
+    speed_only_trajectory.update(
+        std::vector<double>(segment_count, 3.0), positions, zero_yaws);
+    const auto speed_enforced = planning::FeasibilityChecker(
+        planning::TailsitterFlatness(low_speed_parameters), 0.005, 1.0, true)
+                                    .check(speed_only_trajectory);
+    const auto speed_ignored = planning::FeasibilityChecker(
+        planning::TailsitterFlatness(low_speed_parameters), 0.005, 1.0, false)
+                                   .check(speed_only_trajectory);
+    if (speed_enforced.feasible || !speed_ignored.feasible)
+        return fail("feasibility checker velocity switch changed the wrong limits");
+
     std::cout << "joint optimizer test passed; objective "
               << result.initial_terms.total << " -> " << result.final_terms.total
               << ", total time " << initial_total << " -> "

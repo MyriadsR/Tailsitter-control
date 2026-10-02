@@ -9,16 +9,18 @@ namespace planning
 
 FeasibilityChecker::FeasibilityChecker(TailsitterFlatness flatness,
                                        double sample_interval,
-                                       double actuator_margin)
+                                       double actuator_margin,
+                                       bool enforce_velocity_constraint)
     : flatness_(std::move(flatness)),
       sample_interval_(sample_interval),
-      actuator_margin_(actuator_margin)
+      actuator_margin_(actuator_margin),
+      enforce_velocity_constraint_(enforce_velocity_constraint)
 {
     if (!(sample_interval > 0.0) || !(actuator_margin > 0.0 && actuator_margin <= 1.0))
         throw std::invalid_argument("invalid feasibility sampling interval or actuator margin");
     const auto& parameters = flatness_.parameters();
     if (!(parameters.body_rate_max > 0.0) ||
-        !(parameters.velocity_max > 0.0) ||
+        (enforce_velocity_constraint_ && !(parameters.velocity_max > 0.0)) ||
         !(parameters.motor_time_constant > 0.0) ||
         !(parameters.servo_time_constant > 0.0) ||
         !(parameters.servo_rate_max > 0.0))
@@ -107,7 +109,9 @@ FeasibilityReport FeasibilityChecker::check(const FlatOutputTrajectory& trajecto
                 std::abs(prediction.flap_1) / delta_upper - 1.0,
                 std::abs(prediction.flap_2) / delta_upper - 1.0,
                 prediction.angular_velocity.norm() / body_rate_upper - 1.0,
-                sample.velocity.norm() / velocity_upper - 1.0,
+                enforce_velocity_constraint_
+                    ? sample.velocity.norm() / velocity_upper - 1.0
+                    : -std::numeric_limits<double>::infinity(),
                 (collective_thrust_lower - prediction.collective_thrust) /
                     collective_thrust_scale,
                 (prediction.collective_thrust - collective_thrust_upper) /

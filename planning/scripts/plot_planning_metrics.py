@@ -118,6 +118,11 @@ def _parse_args() -> argparse.Namespace:
         "--velocity-max", type=float, default=8.0, help="速度范数上限 [m/s]"
     )
     parser.add_argument(
+        "--no-velocity-limit",
+        action="store_true",
+        help="高层约束图只画速度曲线，不画速度限制线",
+    )
+    parser.add_argument(
         "--collective-thrust-max",
         type=float,
         default=20.25,
@@ -736,7 +741,7 @@ def _plot_high_level_constraints(
     output: Path,
     title: str,
     labels: tuple[str, ...],
-    velocity_max: float,
+    velocity_max: float | None,
     collective_thrust_max: float,
     body_rate_max: float,
     dpi: int,
@@ -775,8 +780,9 @@ def _plot_high_level_constraints(
         r"$\|\Omega\|$ [rad/s]",
     )
     for axis, limit, ylabel in zip(axes, limits, ylabels):
-        axis.axhline(limit, color="#7B3294", linestyle=":", linewidth=1.4,
-                     label="planning limit")
+        if limit is not None:
+            axis.axhline(limit, color="#7B3294", linestyle=":", linewidth=1.4,
+                         label="planning limit")
         axis.axhline(0.0, color="0.35", linewidth=0.8)
         axis.set_ylabel(ylabel)
     axes[0].set_title(f"{title}: high-level constraints", loc="left")
@@ -927,7 +933,7 @@ def main() -> int:
             outputs["high_level_constraints"],
             title,
             high_level_labels,
-            args.velocity_max,
+            None if args.no_velocity_limit else args.velocity_max,
             args.collective_thrust_max,
             args.body_rate_max,
             args.dpi,
