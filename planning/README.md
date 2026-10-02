@@ -147,14 +147,26 @@ NLopt `LD_LBFGS`。`test_stage_b` 同时用中心有限差分检查单点执行�
   --output planning/output/joint_hover_yaw_pi_optimized.csv \
   --baseline-output planning/output/joint_hover_yaw_pi_initial.csv
 
-# 画出轨迹、平滑性、高层约束、执行器幅值和动态约束对比
+# 固定直线 Stage A 对照：同为 15 m、5 个固定等距航路点和 4 s 总时间，
+# 只优化四段时间比例；不优化航路点、不加入约束、不做外层时间缩放
+./planning/build/generate_simple_trajectory \
+  --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-time-scaling \
+  --output planning/output/joint_hover_yaw0_fixed_straight_ratio.csv
+
+./planning/build/generate_simple_trajectory \
+  --yaw-pi --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-time-scaling \
+  --output planning/output/joint_hover_yaw_pi_fixed_straight_ratio.csv
+
+# 联合优化与正确 Stage A 对照的轨迹、平滑性、高层约束、执行器和动态对比
 python3 planning/scripts/plot_planning_metrics.py \
   planning/output/joint_hover_yaw_pi_optimized.csv \
-  --compare-csv planning/output/joint_hover_yaw_pi_initial.csv \
-  --primary-label "Joint optimized" \
-  --compare-label "Initial straight guess" \
-  --prefix joint_hover_yaw_pi \
-  --title "Test 3: 15 m hover-to-hover, yaw 0 to pi" \
+  --compare-csv planning/output/joint_hover_yaw_pi_fixed_straight_ratio.csv \
+  --primary-label "Joint: free time + waypoints + constraints" \
+  --compare-label "Control: fixed 4 s + straight + ratio only" \
+  --prefix joint_hover_yaw_pi_joint_vs_fixed_straight \
+  --title "Test 3 control: yaw 0 to pi" \
   --velocity-max 6.0 \
   --collective-thrust-max 11.390625 \
   --body-rate-max 8.50848010347 \
@@ -199,6 +211,163 @@ free_time_log_bound        1.5
 
 CSV 包含 `collective_thrust` 时，绘图脚本还会生成
 `*_high_level_constraints.png`，显示速度范数、总推力和机体角速度约束。
+
+这里的正式对照不是 `joint_hover_*_initial.csv`。后者只是联合优化器的等时间、
+等距直线数值初值，没有经过任何优化。正式 Stage A 对照保持直线位置航路点
+`x=[0, 3.75, 7.5, 11.25, 15] m` 不变，总时间严格固定为 `4 s`，只用 softmax
+优化四段时间比例，目标只有位置 snap 能量和 yaw acceleration 能量。它不包含
+时间代价、航路点变量以及任何高层/执行器罚函数；程序在优化后运行稠密检查并导出
+执行器列，仅用于诊断，不会反过来影响时间比例。
+
+对照结果为：
+
+| 工况 | 固定直线对照分段时间 [s] | 对照峰值速度 [m/s] | 联合优化峰值速度 [m/s] |
+| --- | --- | ---: | ---: |
+| yaw `0 -> 0` | `[1.515394, 0.484606, 0.484606, 1.515394]` | 8.203125 | 6.049621 |
+| yaw `0 -> pi` | `[1.515349, 0.484651, 0.484651, 1.515349]` | 8.202304 | 6.049637 |
+
+两个固定直线对照都因峰值速度超过完整 `8 m/s` 参考包络而未通过稠密认证；其余
+当前执行器幅值、动态和机体角速度指标均在完整包络内。这不是对照程序失败，而是
+平滑性单目标在完全不知道速度/执行器约束时自然得到的结果。
+
+### 不约束速度：内层联合约束与外层时间缩放
+
+下面的消融实验在两种方法中都取消速度上限，但继续保留并认证总推力、机体角速度、
+单电机推力、舵偏、舵速和电机/舵机一阶动态限制。
+
+```bash
+# 内层联合优化：自由总时间、三个自由位置航路点、无速度罚项
+# 收紧积分与罚权，保证其余约束通过 2 ms 稠密认证
+./planning/build/generate_joint_hover_trajectory \
+  --no-velocity-constraint \
+  --samples-per-segment 100 --actuator-weight 1000 --maxeval 500 \
+  --output planning/output/joint_hover_yaw0_no_velocity_optimized.csv \
+  --baseline-output planning/output/joint_hover_yaw0_no_velocity_initial.csv
+
+./planning/build/generate_joint_hover_trajectory \
+  --yaw-pi --no-velocity-constraint \
+  --samples-per-segment 100 --actuator-weight 1000 --maxeval 500 \
+  --output planning/output/joint_hover_yaw_pi_no_velocity_optimized.csv \
+  --baseline-output planning/output/joint_hover_yaw_pi_no_velocity_initial.csv
+
+# 对照：固定直线先优化 4 s 时间比例，再启用外层统一时间缩放；
+# 外层可行性检查同样忽略速度，只检查其余约束
+./planning/build/generate_simple_trajectory \
+  --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-velocity-constraint \
+  --output planning/output/joint_hover_yaw0_outer_scaled_no_velocity.csv
+
+./planning/build/generate_simple_trajectory \
+  --yaw-pi --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-velocity-constraint \
+  --output planning/output/joint_hover_yaw_pi_outer_scaled_no_velocity.csv
+```
+
+结果如下：
+
+| 工况 | 内层联合时间 [s] | 外层缩放时间 [s] | 内层相对缩短 | 内层/外层峰值速度 [m/s] |
+| --- | ---: | ---: | ---: | ---: |
+| yaw `0 -> 0` | 3.088731 | 3.839007 | 19.54% | 10.816 / 8.547 |
+| yaw `0 -> pi` | 3.073283 | 3.855887 | 20.30% | 10.104 / 8.509 |
+
+四条结果均通过“忽略速度、保留其余限制”的完整包络认证。内层联合方法明显更快，
+但具有更大的 snap、速度、总推力和电机负载；外层缩放保持固定直线和固定时间比例，
+轨迹更平滑保守。内层两次优化均用满约 `500` 次目标评估，因此它们是当前计算预算
+下的可行最优候选，不应宣称为全局最优。
+
+以 yaw `0 -> pi` 生成正式对比图：
+
+```bash
+python planning/scripts/plot_planning_metrics.py \
+  planning/output/joint_hover_yaw_pi_no_velocity_optimized.csv \
+  --compare-csv planning/output/joint_hover_yaw_pi_outer_scaled_no_velocity.csv \
+  --primary-label "Inner joint constraints (no speed limit)" \
+  --compare-label "Outer time scaling (no speed limit)" \
+  --prefix joint_hover_yaw_pi_inner_vs_outer_no_velocity \
+  --title "No velocity constraint: yaw 0 to pi" \
+  --no-velocity-limit \
+  --collective-thrust-max 11.390625 \
+  --body-rate-max 8.50848010347 \
+  --omega-max 1875 --delta-max 0.75 --servo-rate-max 18.75
+```
+
+`--no-velocity-limit` 只取消高层对比图中的速度限制线；速度曲线和峰值仍然正常输出。
+对应两种生成程序中的 `--no-velocity-constraint` 才会真正从内层罚函数、外层可行性
+搜索和最终认证中移除速度判据。
+
+## 阶段 C：显式不等式约束联合优化
+
+阶段 C 使用新的 `generate_stage_c_trajectory`，把测试 3 的十类执行器/高层
+积分从加权罚项升级为 NLopt 显式不等式约束。变量仍是 13 维（4 个独立指数
+分段时间 + 3 个自由航点），时间缩放彻底并入优化。约束行是各类型平方铰链
+积分：行为零当且仅当优化网格上的每个采样在 `actuator_margin` 规划包络内。
+无效平坦映射没有可用梯度，仍以屏障形式留在目标中。
+
+```bash
+# 默认管线：先跑软罚联合优化热启动，再用 SLSQP 硬约束精修
+./planning/build/generate_stage_c_trajectory \
+  --output planning/output/stage_c_yaw0_optimized.csv \
+  --baseline-output planning/output/stage_c_yaw0_initial.csv
+
+./planning/build/generate_stage_c_trajectory \
+  --yaw-pi \
+  --output planning/output/stage_c_yaw_pi_optimized.csv \
+  --baseline-output planning/output/stage_c_yaw_pi_initial.csv
+
+# 三方法对比图：硬约束 vs 软罚 vs 外层时间缩放
+python3 planning/scripts/plot_planning_metrics.py \
+  planning/output/stage_c_yaw_pi_optimized.csv \
+  --compare-csv planning/output/joint_hover_yaw_pi_optimized.csv \
+  --compare-csv-2 planning/output/joint_yaw_pi_outer_scaled.csv \
+  --primary-label "Stage C: hard constraints" \
+  --compare-label "Joint: soft penalty" \
+  --compare-label-2 "Outer time scaling" \
+  --prefix stage_c_vs_penalty_vs_outer_yaw_pi \
+  --title "15 m hover-to-hover, yaw 0 to pi"
+```
+
+求解器默认直接使用 NLopt `LD_SLSQP`；消融实验中 `auglag-mma`、
+`auglag-ccsaq`、`auglag-slsqp` 与直接 `mma` 在 240 次评估预算内均未能从深度
+不可行初值到达可行（`--solver` 可切换，`--cold-start` 可跳过热启动）。
+默认管线先在 `20` 采样/段的粗网格上跑软罚联合预优化作为热启动
+（`--coarse-samples` 可调，`0` 退回细网格软罚热启动），SLSQP 再在 `50`
+采样/段的细网格上做硬约束精修。15 m、速度约束开启时三方法对照为：
+
+| 方法 | yaw `0->0` 总时间 [s] | yaw `0->pi` 总时间 [s] | 75% 规划包络满足情况 | 稠密认证 (margin 1.0) |
+| --- | ---: | ---: | --- | --- |
+| 外层时间缩放（固定直线+比例） | 4.102958 | 4.101423 | 不适用（直接用全包络） | 通过（峰值速度 7.997-7.999） |
+| 软罚联合（测试 3 复跑） | 3.921840 | 3.921941 | 峰值速度超出 6 m/s 软阈值约 0.8% | 通过 |
+| 阶段 C 硬约束（热启动） | 3.948456 | 3.948956 | 全部采样严格满足（残余 ≤ 4.8e-4） | 通过（峰值速度 6.002，恰好贴界） |
+
+阶段 C 比软罚解慢约 0.7%，换来的是规划裕量下的硬保证：软罚解依赖最重的
+权在 200 时仍留下 0.8% 的软越界，而阶段 C 的峰值速度精确停在 6.0 m/s 规划
+边界上。热启动是必需的：yaw `0->pi` 从直线冷启动时初始点含无效映射样本
+（屏障常值、零梯度），SLSQP 在 100 次评估后停在不可行点；yaw `0->0`
+冷启动可用。同一台机器上的规划耗时（含最终 2 ms 稠密认证，三轮平均）：
+
+| 方法 | 优化前 | 优化后 | 加速比 |
+| --- | ---: | ---: | ---: |
+| 外层时间缩放 | ~9.5 s | ~9.3 s（未改动） | 1.0x |
+| 软罚联合 | ~13.1 s | ~4.2 s | 3.2x |
+| 阶段 C 完整管线（yaw `0->0`） | ~22.0 s | ~3.5 s | 6.3x |
+| 阶段 C 完整管线（yaw `0->pi`） | ~25.3 s | ~4.4 s | 5.7x |
+
+加速来自两项数值等价/近似等价的重构：一，`integrateActuatorPenalty`
+改为惰性 Jacobian——微基准显示单次线性化（15 维 AutoDiff，约 837 us）是
+单次前向映射（Jet2，约 46 us）的 18 倍，而铰链未激活的采样点梯度贡献恰为
+零，因此只有携带梯度质量的采样（幅值铰链激活或邻接激活动力学区间）才做
+线性化，且重载复用一遍式预测与已选姿态分支避免重复前向；二，热启动
+预优化降到粗网格（20 采样/段约为细网格单次评估的 1/3 成本，实测还减少了
+迭代数），SLSQP 精修保持在细网格。最终认证始终为 2 ms 全包络稠密检查，
+不参与加速折衷。
+
+`test_stage_c` 覆盖：10×13 约束 Jacobian 中心差分校验（阈值 1e-2，见下）、
+求解后全部约束行 ≤ 1e-6、端点固定、搜索盒不越界、以及 margin 1.0 的 2 ms
+稠密认证。已知非光滑性：yaw 样条只有 C² 连续，yaw jerk 在分段节点跳变，
+而电机转速依赖 yaw 加速度，因此动力学约束行在节点采样上的移动项只有单侧
+导数，与中心差分（两侧平均）存在最高约 1% 的固有偏差；该偏差在阶段 C
+之前的组合目标梯度中同样存在，只是被大数值平滑项的相对尺度掩盖。这不是
+装配错误，是"罚函数采样点恰好落在节点上"这一离散化的固有性质。
 
 ## 测试 3 的闭环跟踪
 
@@ -249,6 +418,9 @@ planning/output/figures/joint_hover_closed_loop_actuators.png
 - 阶段 B 使用固定姿态分支的执行器/机体角速度自动微分梯度和有界 L-BFGS；
   幅值、角速度、舵面速率和一阶动态命令限制均为采样软罚函数，最终由独立稠密
   检查认证。
+- 阶段 C（`generate_stage_c_trajectory`）把十类采样积分改为 NLopt 显式不等式
+  约束（默认 `LD_SLSQP`，软罚解热启动），在优化网格上严格满足规划裕量；
+  连续时间保证仍由最终稠密检查提供。
 - 外层先粗扫全部缩放范围，再细化每个“不可行到可行”的切换区间，不假设全局单调。
 - 稠密检查显式加入样条连接点；默认最终间隔为 2 ms，可在 `FeasibilityChecker` 构造时收紧到 0.5–1 ms。
 - 当前只处理位置/yaw 航点和首末端零导数。复杂特技所需的中间速度/加速度等式约束属于后续阶段。

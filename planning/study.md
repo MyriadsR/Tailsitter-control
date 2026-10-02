@@ -7352,6 +7352,645 @@ $$
 
 完整 CTest 为 `3/3 passed`。
 
+### 19.10 固定直线、固定总时间、仅优化时间比例的正式对照
+
+#### 19.10.1 对照定义
+
+测试 3 的正式对照不是 `joint_hover_*_initial.csv`。该 initial CSV 只是联合优化
+开始前的数值初值，没有经过优化，不能代表“固定时间规划方法”。正确对照沿用
+Stage A 的方法，并只改变场景尺寸以与测试 3 一致：
+
+- 起点和终点仍为 $(0,0,-10)$ m 与 $(15,0,-10)$ m；
+- 五个位置航路点固定在同一直线上：
+
+$$
+\boxed{x=[0,3.75,7.5,11.25,15]\ \mathrm m,\quad y=0,\quad z=-10\ \mathrm m};
+$$
+
+- yaw `0 -> 0` 时所有 yaw 均为零；
+- yaw `0 -> pi` 时固定为 $[0,\pi/4,\pi/2,3\pi/4,\pi]$；
+- 总时间严格固定为 $T_f=4\ \mathrm s$；
+- 中间位置航路点不参与优化；
+- 不执行外层整体时间缩放；
+- 不在目标中加入速度、总推力、机体角速度、执行器幅值、速率或动态约束。
+
+唯一优化变量是四段时间比例。与 Stage A 相同，把最后一个 logit 固定为零，前三个
+为自由变量 $\boldsymbol\tau\in\mathbb R^3$：
+
+$$
+\boxed{
+T_i=4\frac{e^{\tau_i}}{\sum_{j=1}^{4}e^{\tau_j}},
+\qquad \tau_4=0
+}.
+$$
+
+因此 $T_i>0$ 且 $\sum_iT_i=4\ \mathrm s$ 由构造严格满足。对照目标只有
+
+$$
+\boxed{
+\min_{\boldsymbol\tau}\quad
+J_A=\int_0^4\|\mathbf p^{(4)}(t)\|^2dt
++\rho_\psi\int_0^4\ddot\psi(t)^2dt
+}.
+$$
+
+这里没有 $\rho_TT_f$、几何偏移项或 $J_{\mathrm{constraint}}$。优化完成后的平坦
+映射和 `FeasibilityChecker` 只负责输出诊断指标，不参与 L-BFGS 目标及梯度，
+所以不会把执行器约束偷偷加入对照实验。
+
+#### 19.10.2 运行命令
+
+`generate_simple_trajectory` 新增了可选的 `--distance`、`--waypoint-count` 和
+`--total-time`，未提供这些参数时仍保持原 6 m 三航路点实验不变。测试 3 对照为：
+
+```bash
+./planning/build/generate_simple_trajectory \
+  --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-time-scaling \
+  --output planning/output/joint_hover_yaw0_fixed_straight_ratio.csv
+
+./planning/build/generate_simple_trajectory \
+  --yaw-pi --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-time-scaling \
+  --output planning/output/joint_hover_yaw_pi_fixed_straight_ratio.csv
+```
+
+与自由时间联合优化结果对比，以 yaw `0 -> pi` 为例：
+
+```bash
+python planning/scripts/plot_planning_metrics.py \
+  planning/output/joint_hover_yaw_pi_optimized.csv \
+  --compare-csv planning/output/joint_hover_yaw_pi_fixed_straight_ratio.csv \
+  --primary-label "Joint: free time + waypoints + constraints" \
+  --compare-label "Control: fixed 4 s + straight + ratio only" \
+  --prefix joint_hover_yaw_pi_joint_vs_fixed_straight \
+  --title "Test 3 control: yaw 0 to pi" \
+  --velocity-max 6.0 \
+  --collective-thrust-max 11.390625 \
+  --body-rate-max 8.50848010347 \
+  --omega-max 1875 \
+  --delta-max 0.75 \
+  --servo-rate-max 18.75
+```
+
+#### 19.10.3 优化结果
+
+| 指标 | yaw `0 -> 0` | yaw `0 -> pi` |
+| --- | ---: | ---: |
+| 固定总时间 [s] | 4.000000 | 4.000000 |
+| 优化分段时间 [s] | `[1.515394, 0.484606, 0.484606, 1.515394]` | `[1.515349, 0.484651, 0.484651, 1.515349]` |
+| 初始平滑能量 | 61619.575614 | 61623.805445 |
+| 最终平滑能量 | 1384.277344 | 1387.972260 |
+| 峰值速度 [m/s] | 8.203125 | 8.202304 |
+| 峰值总推力 [N] | 8.126835 | 8.141822 |
+| 峰值机体角速度 [rad/s] | 3.403672 | 6.820617 |
+| 峰值电机转速 [rad/s] | 1583.755823 | 1590.530562 |
+| 峰值绝对舵偏 [rad] | 0.364346 | 0.449609 |
+| 峰值绝对舵速 [rad/s] | 1.504476 | 4.593597 |
+| 完整包络认证 | 不通过 | 不通过 |
+
+两条对照均只有速度违反完整包络：
+
+$$
+8.203125>8.0\ \mathrm{m/s},
+\qquad
+8.202304>8.0\ \mathrm{m/s}.
+$$
+
+其余表中执行器、动态和机体角速度峰值都在完整物理/参考包络内。由于优化根本没有
+看到速度约束，认证不通过正是有效的实验结果，而不是优化器或导出程序失败。
+
+#### 19.10.4 与自由时间联合优化的比较
+
+| 指标 | yaw `0 -> 0` 对照 | yaw `0 -> 0` 联合 | yaw `0 -> pi` 对照 | yaw `0 -> pi` 联合 |
+| --- | ---: | ---: | ---: | ---: |
+| 总时间 [s] | 4.000000 | 3.921840 | 4.000000 | 3.921932 |
+| 峰值速度 [m/s] | 8.203125 | 6.049621 | 8.202304 | 6.049637 |
+| 稠密积分平滑能量 | 1384.287 | 6988.171 | 1387.982 | 6988.293 |
+| 峰值机体角速度 [rad/s] | 3.403672 | 3.798220 | 6.820617 | 2.783937 |
+| 峰值舵速 [rad/s] | 1.504476 | 1.662690 | 4.593597 | 0.538798 |
+| 完整包络认证 | 不通过 | 通过 | 不通过 | 通过 |
+
+固定直线平滑性单目标把首末段拉长、中央两段压缩，使整条位置轨迹接近一次连续的
+起停运动。这样能显著降低 snap 能量，却把中部速度峰值推到约
+$8.20\ \mathrm{m/s}$。联合优化虽然总时间反而略短，但速度约束使它形成接近
+$6\ \mathrm{m/s}$ 的速度平台；从加速段进入平台、再从平台减速需要更强的 snap，
+因此它的平滑能量高于不考虑约束的对照。
+
+这组结果不能解读为“联合优化的平滑性更好”。准确结论是：
+
+1. 固定时间比例优化在其唯一目标——平滑能量——上更优，但产生不可接受的速度峰值；
+2. 联合优化牺牲平滑能量，换取更短总时间和完整高层/执行器包络可行性；
+3. yaw `0 -> pi` 中，加入约束后机体角速度从 $6.82$ 降到 $2.78\ \mathrm{rad/s}$，
+   舵速从 $4.59$ 降到 $0.54\ \mathrm{rad/s}$，约束整形效果尤其明显。
+
+#### 19.10.5 对比图输出
+
+每种 yaw 都生成五张图：
+
+```text
+planning/output/figures/joint_hover_yaw0_joint_vs_fixed_straight_trajectory_speed.png
+planning/output/figures/joint_hover_yaw0_joint_vs_fixed_straight_smoothness.png
+planning/output/figures/joint_hover_yaw0_joint_vs_fixed_straight_actuators.png
+planning/output/figures/joint_hover_yaw0_joint_vs_fixed_straight_dynamic_constraints.png
+planning/output/figures/joint_hover_yaw0_joint_vs_fixed_straight_high_level_constraints.png
+
+planning/output/figures/joint_hover_yaw_pi_joint_vs_fixed_straight_trajectory_speed.png
+planning/output/figures/joint_hover_yaw_pi_joint_vs_fixed_straight_smoothness.png
+planning/output/figures/joint_hover_yaw_pi_joint_vs_fixed_straight_actuators.png
+planning/output/figures/joint_hover_yaw_pi_joint_vs_fixed_straight_dynamic_constraints.png
+planning/output/figures/joint_hover_yaw_pi_joint_vs_fixed_straight_high_level_constraints.png
+```
+
+### 19.11 无速度约束：内层联合约束与外层时间缩放
+
+#### 19.11.1 实验目的与公平约束集合
+
+这一组对比不再限制最大平动速度，目的是观察执行器与姿态相关约束本身对最短时间
+的限制。两种方法都忽略
+
+$$
+\|\mathbf v(t)\|\le v_{\max},
+$$
+
+但都继续检查：
+
+$$
+\boxed{
+T,\ \|\boldsymbol\Omega\|,\ T_1,T_2,\ \delta_1,\delta_2,
+\ \dot\delta_1,\dot\delta_2,
+\ \omega_{cmd,1},\omega_{cmd,2},
+\ \delta_{cmd,1},\delta_{cmd,2}
+}.
+$$
+
+第一种方法是测试 3 的内层联合优化：四段时间和三个中间位置航路点同时优化，目标
+仍含平滑性、总时间、几何偏移和上述约束罚函数。新增配置
+`enable_velocity_constraint=false` 只令
+
+$$
+J_{velocity}=0,
+\qquad
+\frac{\partial J_{velocity}}{\partial\mathbf v}=\mathbf0,
+$$
+
+不会关闭同一高层模块中的总推力罚函数。第二种方法是 Stage A 外层策略：固定直线
+位置航路点，在 $4$ s 下先优化时间比例，再对所有段施加统一尺度 $s$：
+
+$$
+T_i^{scaled}=sT_i^{ratio}.
+$$
+
+`TimeScaler` 在 $s\in[0.25,3]$ 粗扫全部范围，并细化每个不可行到可行的切换区间；
+本实验的 `FeasibilityChecker` 同样关闭速度判据，所以两组最终认证使用相同的“除
+速度外全部约束”集合。速度峰值仍被记录和绘图，只是不决定可行性。
+
+#### 19.11.2 为什么收紧内层采样和罚权
+
+关闭速度罚项后，默认 `50` 区间、罚权 `200` 的联合优化会主动把总时间压到约
+$2.96$ s。该候选在目标采样点上的罚值很小，但 $2$ ms 稠密检查发现样条连接点
+附近的舵面变化过快，所需舵机命令超过限制，因此不能作为有效结果。
+
+最终实验采用
+
+```text
+samples_per_segment = 100
+actuator_weight      = 1000
+max_evaluations      = 500
+```
+
+更密的积分节点提高了连接点附近快速变化被目标捕捉的概率，更高罚权则使优化器优先
+消除剩余约束违反。两条最终候选均通过 $2$ ms 稠密认证。这个过程也再次说明采样
+平方罚函数不是数学硬约束，最终独立认证不能省略。
+
+#### 19.11.3 运行命令
+
+内层联合优化：
+
+```bash
+./planning/build/generate_joint_hover_trajectory \
+  --no-velocity-constraint \
+  --samples-per-segment 100 --actuator-weight 1000 --maxeval 500 \
+  --output planning/output/joint_hover_yaw0_no_velocity_optimized.csv \
+  --baseline-output planning/output/joint_hover_yaw0_no_velocity_initial.csv
+
+./planning/build/generate_joint_hover_trajectory \
+  --yaw-pi --no-velocity-constraint \
+  --samples-per-segment 100 --actuator-weight 1000 --maxeval 500 \
+  --output planning/output/joint_hover_yaw_pi_no_velocity_optimized.csv \
+  --baseline-output planning/output/joint_hover_yaw_pi_no_velocity_initial.csv
+```
+
+外层时间缩放对照：
+
+```bash
+./planning/build/generate_simple_trajectory \
+  --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-velocity-constraint \
+  --output planning/output/joint_hover_yaw0_outer_scaled_no_velocity.csv
+
+./planning/build/generate_simple_trajectory \
+  --yaw-pi --distance 15 --waypoint-count 5 --total-time 4 \
+  --no-velocity-constraint \
+  --output planning/output/joint_hover_yaw_pi_outer_scaled_no_velocity.csv
+```
+
+#### 19.11.4 时间、轨迹和计算结果
+
+| 指标 | yaw `0 -> 0` 内层联合 | yaw `0 -> 0` 外层缩放 | yaw `0 -> pi` 内层联合 | yaw `0 -> pi` 外层缩放 |
+| --- | ---: | ---: | ---: | ---: |
+| 总时间 [s] | 3.088731 | 3.839007 | 3.073283 | 3.855887 |
+| 相对外层缩短 | 19.54% | — | 20.30% | — |
+| 峰值速度 [m/s] | 10.816327 | 8.547133 | 10.104029 | 8.508863 |
+| 稠密积分平滑能量 | 21321.42 | 1845.50 | 11181.47 | 1793.81 |
+| 目标评估数 | 500 | 一维粗扫+细化 | 501 | 一维粗扫+细化 |
+| 除速度外完整认证 | 通过 | 通过 | 通过 | 通过 |
+
+内层联合优化通过改变几何和独立段时间，把总时间进一步减少约 $20\%$；代价是速度
+和 snap 显著上升。外层策略只能整体缩放已经确定的固定直线和时间比例，因此更
+平滑、计算量也明显更小，但无法利用几何自由度绕开局部执行器困难。
+
+内层优化的自由航路点为：
+
+| 工况 | 航路点 1 [m] | 航路点 2 [m] | 航路点 3 [m] |
+| --- | --- | --- | --- |
+| yaw `0 -> 0` | `[3.287334, 0.066085, -9.804226]` | `[6.583536, 0.036108, -9.316275]` | `[11.132406, -0.026272, -9.248792]` |
+| yaw `0 -> pi` | `[3.046483, 0.053454, -9.557499]` | `[6.989089, 0.123744, -9.187696]` | `[11.584073, 0.121615, -9.337027]` |
+
+与有速度约束时几乎保持 $z=-10$ 的结果不同，取消速度限制后优化器明显抬高飞行
+轨迹，即 NED 的 $z$ 变得更接近零。当前没有安全走廊或高度保持约束，所以这是
+合法的搜索结果；如果希望比较时仍严格保持水平直线，应固定 $y,z$ 航路点或把
+自由点搜索范围的对应分量设为零。
+
+#### 19.11.5 其余约束指标
+
+| 指标 | yaw `0 -> 0` 内层 | yaw `0 -> 0` 外层 | yaw `0 -> pi` 内层 | yaw `0 -> pi` 外层 |
+| --- | ---: | ---: | ---: | ---: |
+| 峰值总推力 [N] | 10.821399 | 8.358785 | 9.516372 | 8.350349 |
+| 峰值机体角速度 [rad/s] | 4.043370 | 3.829850 | 8.398903 | 7.890257 |
+| 峰值电机转速 [rad/s] | 1830.494281 | 1606.198014 | 1730.165372 | 1611.345490 |
+| 峰值绝对舵偏 [rad] | 0.408827 | 0.381510 | 0.464738 | 0.523634 |
+| 峰值绝对舵速 [rad/s] | 1.939349 | 1.874421 | 6.288327 | 7.337881 |
+| 峰值所需电机命令 [rad/s] | 1834.439025 | 1607.556680 | 1732.760532 | 1612.555624 |
+| 峰值所需舵机命令 [rad] | 0.397267 | 0.386128 | 0.541183 | 0.608719 |
+
+两组不是每个执行器指标都由内层更低。例如 yaw `0 -> pi` 中，内层的舵偏、舵速
+和所需舵机命令低于外层对照，但电机转速和总推力更高。这说明联合优化利用航路点
+变化在电机负载与舵面负载之间重新分配控制需求，而外层统一缩放只能沿原曲线改变
+所有导数的整体尺度。
+
+yaw `0 -> pi` 的内层机体角速度峰值 $8.3989\ \mathrm{rad/s}$ 已接近 $75\%$
+规划阈值 $8.5085\ \mathrm{rad/s}$，表明在没有速度约束时，机体角速度成为更主要的
+活跃限制之一。内层两次运行都用满约 `500` 次评估，因此表中结果应称为当前预算
+下通过认证的可行最优候选，而不是全局最短时间证明。
+
+#### 19.11.6 对比图
+
+绘图时使用 `--no-velocity-limit`，只隐藏没有启用的速度限制线，不隐藏速度曲线：
+
+```bash
+python planning/scripts/plot_planning_metrics.py \
+  planning/output/joint_hover_yaw_pi_no_velocity_optimized.csv \
+  --compare-csv planning/output/joint_hover_yaw_pi_outer_scaled_no_velocity.csv \
+  --primary-label "Inner joint constraints (no speed limit)" \
+  --compare-label "Outer time scaling (no speed limit)" \
+  --prefix joint_hover_yaw_pi_inner_vs_outer_no_velocity \
+  --title "No velocity constraint: yaw 0 to pi" \
+  --no-velocity-limit \
+  --collective-thrust-max 11.390625 \
+  --body-rate-max 8.50848010347 \
+  --omega-max 1875 --delta-max 0.75 --servo-rate-max 18.75
+```
+
+两种 yaw 各输出 trajectory-speed、smoothness、actuators、dynamic-constraints 和
+high-level-constraints 五张图，文件前缀分别为：
+
+```text
+joint_hover_yaw0_inner_vs_outer_no_velocity_*
+joint_hover_yaw_pi_inner_vs_outer_no_velocity_*
+```
+
+### 19.12 为什么 GCOPTER 含位置等约束仍能达到毫秒级
+
+#### 19.12.1 结论与比较口径
+
+GCOPTER 快的主要原因不是“约束数量少”，而是它通过 MINCO 稀疏参数化、几何约束
+消元和反向梯度传播，使每一次目标函数及梯度计算都非常便宜。当前项目的主要开销
+则不是自由航路点的位置边界，而是尾座式平坦输出经过气动力、姿态分支、力矩和
+执行器分配之后的完整约束映射及其自动微分。
+
+[GCOPTER 论文](https://arxiv.org/abs/2103.00190)的窄缝 SE(3) 规划实验在 Intel
+Core i7-8700 上报告了约 $4.7\sim7.4\ \mathrm{ms}$ 的计算时间，但这个数字对应规模
+较小、已经给定安全飞行走廊的具体轨迹优化算例，不能理解为任意地图规模、任意轨迹
+段数和任意用户动力学模型都固定为毫秒级。[GCOPTER 官方实现](https://github.com/ZJU-FAST-Lab/GCOPTER)
+也把走廊生成、MINCO、标准多旋翼平坦映射和 L-BFGS 组织成专门的高性能 C++ 实现。
+因此，论文结果和当前程序的分钟级结果只有在统一模型、积分分辨率、停止条件、编译
+选项及计时范围后才能直接比较。
+
+#### 19.12.2 GCOPTER 的位置约束为何很便宜
+
+对于凸多面体安全走廊
+
+$$
+\mathcal P_i=\{\mathbf p\mid A_i\mathbf p\leq\mathbf b_i\},
+$$
+
+GCOPTER 并不一定把所有半空间不等式直接交给通用约束 NLP 求解器，而是对位于相邻
+走廊交集内的中间点使用光滑映射
+
+$$
+\boldsymbol\xi_i\in\mathbb R^{n_i}
+\longmapsto
+\mathbf q_i=f_{\mathcal P_i}(\boldsymbol\xi_i)\in\mathcal P_i.
+$$
+
+这样，优化器实际处理的是无约束变量：
+
+$$
+\min_{\boldsymbol\xi,\boldsymbol\tau}
+J\!\left(\mathbf q(\boldsymbol\xi),\mathbf T(\boldsymbol\tau)\right).
+$$
+
+直接定义在决策变量上的位置合法性由参数化自动满足，不需要每一步求投影、KKT 系统
+或大量不等式的可行方向。走廊顶点/重心坐标映射的主要计算只是小规模矩阵运算。轨迹
+沿整段位于走廊内等连续时间条件仍可采用采样积分罚函数处理，但单个位置约束值
+
+$$
+g_p(t)=A_i\mathbf p(t)-\mathbf b_i
+$$
+
+只是多项式求值和矩阵乘法，远小于尾座式执行器映射的成本。
+
+当前测试 3 没有安全走廊；三个自由航路点只采用有界归一化偏移，所以位置变量本身
+甚至比典型 GCOPTER 安全走廊问题简单。它不是当前运行时间的主要来源。
+
+#### 19.12.3 MINCO 如何减少优化变量和梯度成本
+
+GCOPTER 不直接优化每段多项式的全部系数，而主要优化中间节点和分段时间：
+
+$$
+\mathbf q=[\mathbf q_1,\ldots,\mathbf q_{M-1}],
+\qquad
+\mathbf T=[T_1,\ldots,T_M].
+$$
+
+给定 $\mathbf q$ 和 $\mathbf T$ 后，多项式系数由最小控制量最优性条件恢复：
+
+$$
+A(\mathbf T)\mathbf c=\mathbf b(\mathbf q).
+$$
+
+矩阵 $A$ 具有带状结构，因此轨迹构造、控制能量计算和系数梯度向节点/时间的传播
+都可做到
+
+$$
+O(M).
+$$
+
+当前项目使用的 `SplineTrajectory` 同样以节点和时间作为稀疏参数，并采用
+$O(M)$ 的块三对角结构。因此当前程序与 GCOPTER 在样条后端上的数量级基本相同；
+真正的差距在每个积分点上调用的尾座式模型和梯度计算。
+
+#### 19.12.4 两类约束的单点成本不是一个数量级
+
+GCOPTER 典型多旋翼算例的约束包括
+
+$$
+\|\mathbf v\|\leq v_{\max},\qquad
+f_{\min}\leq f\leq f_{\max},\qquad
+\|\boldsymbol\omega\|\leq\omega_{\max},
+$$
+
+以及位置半空间约束 $A\mathbf p-\mathbf b\preceq0$。位置、速度等约束只需评估
+多项式及其导数；标准多旋翼平坦映射的主要形式也较短：
+
+$$
+\mathbf f=m(\mathbf a-\mathbf g),\qquad
+f=\|\mathbf f\|,\qquad
+R=R(\mathbf f,\psi),\qquad
+\boldsymbol\omega=\boldsymbol\omega(\mathbf a,\mathbf j,\psi,\dot\psi).
+$$
+
+当前尾座式单个采样点则需要完成
+
+$$
+\begin{aligned}
+(&\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi)\\
+&\longrightarrow(R,\boldsymbol\Omega,\dot{\boldsymbol\Omega},T)\\
+&\longrightarrow\mathbf M
+\longrightarrow(T_1,T_2,\delta_1,\delta_2)\\
+&\longrightarrow(\omega_1,\omega_2)
+\longrightarrow
+(u_{\omega,1},u_{\omega,2},u_{\delta,1},u_{\delta,2}).
+\end{aligned}
+$$
+
+其中包含：
+
+1. 多个姿态候选分支的枚举、可行性判断和连续分支选择；
+2. `atan2`、三角函数、开方以及气动力耦合；
+3. 角加速度、惯性力矩和差动推力计算；
+4. 舵面 $2\times2$ 分配矩阵的奇异性检查和求解；
+5. 负推力、非有限值和分支奇异性检查；
+6. 相邻采样点之间的电机、舵机一阶动态、舵速和所需命令约束。
+
+所以“一个位置约束”与“一个真实执行器及动态约束”虽然在数学表述中都算一个约束，
+单次评估成本却可能相差几个数量级。
+
+#### 19.12.5 当前一次目标评估实际完成多少计算
+
+测试 3 的最终内层配置为四段轨迹、每段 `100` 个积分区间。代码在
+`planning/src/actuator_penalty_optimizer.cpp:307-479` 中对每段端点也采样，因此
+一次目标函数及梯度计算包含
+
+$$
+N_{map}=4(100+1)=404
+$$
+
+次完整平坦映射和线性化。随后
+`planning/src/actuator_penalty_optimizer.cpp:481-599` 又对相邻采样点计算执行器动态，
+一次评估包含
+
+$$
+N_{dyn}=4\times100=400
+$$
+
+个动态区间。
+
+本次两个 yaw 工况分别使用约 `500` 次目标评估，所以每个工况累计约为
+
+$$
+404\times500\approx2.02\times10^5
+$$
+
+次带梯度的尾座式映射，以及
+
+$$
+400\times500=2.0\times10^5
+$$
+
+次相邻节点执行器动态计算。若每个工况顺序运行约 $2\sim3$ min，则摊到一次目标
+及梯度评估约为
+
+$$
+t_{eval}\approx0.24\sim0.36\ \mathrm{s}.
+$$
+
+因此分钟级时间主要来自“大约半百万次昂贵的节点/区间运算”，不是因为优化变量只有
+十几个却仍被求解器无缘无故拖慢。两个工况并行执行时观察到的约四分钟总墙钟时间还
+包含了二者竞争 CPU 的影响。
+
+#### 19.12.6 当前 15 方向前向自动微分的成本
+
+当前每个采样点对以下 15 个平坦量求导：
+
+$$
+\underbrace{\mathbf v,\mathbf a,\mathbf j,\mathbf s}_{12},
+\qquad
+\underbrace{\psi,\dot\psi,\ddot\psi}_{3}.
+$$
+
+具体形成
+
+$$
+\frac{\partial(T_1,T_2,\delta_1,\delta_2)}
+{\partial(\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi)}
+\in\mathbb R^{4\times15}
+$$
+
+和
+
+$$
+\frac{\partial\boldsymbol\Omega}
+{\partial(\mathbf v,\mathbf a,\mathbf j,\mathbf s,
+\psi,\dot\psi,\ddot\psi)}
+\in\mathbb R^{3\times15}.
+$$
+
+`Eigen::AutoDiffScalar` 的每个标量都携带一个 15 维导数向量，所以平坦映射内部
+的大部分标量加减乘除和初等函数都同时传播 15 个方向。更重要的是，当前
+`TailsitterFlatness::linearize()` 在
+`planning/src/tailsitter_flatness.cpp:803-862` 内顺序执行：
+
+1. 普通 `forward()`，用于选择连续姿态分支；
+2. 固定分支的普通 `evaluateFixedBranchActuators<double>()`；
+3. 固定分支的 `evaluateFixedBranchActuators<ADScalar>()`。
+
+所以一个带梯度采样点实际重复执行了多次相近的平坦映射计算。
+
+GCOPTER 更强调标量总代价的反向传播。对
+
+$$
+J=J(\mathbf y),\qquad
+\mathbf y=(\mathbf v,\mathbf a,\mathbf j,\ldots),
+$$
+
+反向模式直接从约束罚函数的伴随量传播
+
+$$
+\bar{\mathbf y}=\frac{\partial J}{\partial\mathbf y},
+$$
+
+其复杂度通常是一次前向映射的常数倍，而不是让每个中间标量都携带全部输入方向。
+当前输入维数为 15、输出最终被压缩成一个标量目标，因此手工反向梯度通常比完整
+前向 Jacobian 更合适。
+
+#### 19.12.7 当前还是未优化编译
+
+当前 `planning/build/CMakeCache.txt` 中 `CMAKE_BUILD_TYPE` 为空，生成的
+`planning/build/CMakeFiles/generate_joint_hover_trajectory.dir/flags.make` 只有
+
+```text
+-std=c++17
+```
+
+没有 `-O2` 或 `-O3`。对 Eigen 表达式模板、自定义 Jet 运算和 AutoDiff 来说，
+未优化编译会产生非常明显的额外开销。GCOPTER 官方运行说明甚至建议把 CPU governor
+设置为 `performance`，可见论文中的毫秒级数字本身就是面向性能的测试口径。
+
+因此，当前分钟级程序与 GCOPTER 论文结果之间首先存在编译配置差异。单独建立
+Release 目录可以避免覆盖现有调试构建：
+
+```bash
+cmake -S planning -B planning/build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build planning/build-release -j
+```
+
+Release 构建很可能显著缩短模板化数值代码的时间，但在完成实际计时前不应承诺具体
+倍数，更不能据此保证完整尾座式执行器动态规划也会直接达到 $5\ \mathrm{ms}$。
+
+#### 19.12.8 GCOPTER 的连续时间约束也不是无限精度硬约束
+
+GCOPTER 将一般状态—输入限制写成积分罚函数：
+
+$$
+I_G=\int_0^T\max(G(t),0)^k\,dt,
+$$
+
+实际再用梯形积分离散：
+
+$$
+I_G\approx
+\sum_{i=1}^{M}\frac{T_i}{\kappa_i}
+\sum_{j=0}^{\kappa_i}\bar\omega_j
+\max\!\left(
+G\!\left(\frac{jT_i}{\kappa_i}\right),0
+\right)^k.
+$$
+
+它同样是有限采样、有限罚权下的连续约束近似。论文也明确讨论：若要由这种方法让
+违反量数学上严格为零，需要趋于无穷的罚权或积分分辨率。毫秒级速度因此并不等价
+于以极密时间间隔完成了无限精度硬约束证明。
+
+当前实现除了在优化中每段使用 100 个区间，还在优化结束后进行 $2\ \mathrm{ms}$
+稠密独立认证，并检查实际执行器状态、相邻点反演的执行器命令和变化率。这个验证
+口径比典型 GCOPTER 多旋翼示例更重。二者都使用积分罚函数思想，但不能只比较最终
+墙钟时间而忽略约束模型与认证分辨率。
+
+#### 19.12.9 差异汇总
+
+| 项目 | GCOPTER 典型算例 | 当前尾座式联合优化 |
+| --- | --- | --- |
+| 位置约束 | 光滑映射消元或简单半空间代价 | 自由点有界偏移，不是主要开销 |
+| 样条参数化 | MINCO，$O(M)$ | SplineTrajectory，基本同类 |
+| 单点动力学 | 标准多旋翼平坦映射 | 尾座式气动、分支、力矩和执行器分配 |
+| 梯度 | 解析/反向梯度传播 | 15 维前向 AutoDiff Jacobian |
+| 每段积分区间 | 可采用较低有限分辨率 | 最终实验为 100 |
+| 执行器动态 | 典型示例一般不含电机/舵机一阶动态 | 额外计算状态、命令和变化率 |
+| 目标评估数 | 小规模问题可快速收敛 | 本次达到约 500 次评估上限 |
+| 最终认证 | 有限积分罚函数精度 | 额外 $2\ \mathrm{ms}$ 稠密认证 |
+| 编译/CPU | 面向性能的论文测试配置 | 当前构建无 `-O2/-O3` |
+
+因此，GCOPTER 包含位置、速度、推力和角速度等约束却仍然很快并不矛盾：决定耗时的
+是约束计算图的复杂度、采样数、梯度模式、优化评估次数和编译配置，而不是约束名称
+或约束条数。
+
+#### 19.12.10 推荐的加速实施顺序
+
+在不删除真实执行器约束的前提下，后续应按以下顺序优化性能：
+
+1. **建立 Release 基准**：在完全相同初值、参数和 `maxeval` 下分别记录 Debug/当前
+   构建与 `-O3` Release 的单次目标梯度时间和总时间；
+2. **分阶段计时**：分别统计样条更新、轨迹采样、普通平坦映射、AutoDiff 映射、
+   罚函数累加、执行器动态和样条梯度回传，先确认实际热点；
+3. **粗到细热启动**：先以每段 $30\sim50$ 个区间求得可行附近候选，再把该候选作为
+   每段 100 区间的初值，避免高分辨率优化从等时间直线初值运行 500 次；
+4. **消除重复前向计算**：缓存姿态分支和固定分支的公共中间量，避免
+   `forward()`、普通固定分支和 AD 固定分支重复完成相同运算；
+5. **改为标量目标的反向梯度**：不再构造每点完整 $4\times15$ 和 $3\times15$
+   Jacobian，而从活跃罚函数直接向 15 个平坦量传播伴随梯度；
+6. **约束筛选与自适应采样**：远离边界的区间采用较稀节点，仅在舵面、角速度或
+   执行器命令快速变化处加密；最终仍保留独立 $2\ \mathrm{ms}$ 认证；
+7. **改善变量尺度和终止条件**：时间、位置、平滑能量和高权重罚项需要量纲一致的
+   尺度，减少 L-BFGS 在线搜索中因刚性罚函数造成的无效评估。
+
+第一至第三步不改变数学模型，应该优先实施。第四、第五步最可能带来算法层面的主要
+加速，但需要重新做解析梯度—有限差分一致性测试。即使这些步骤全部完成，保留完整
+尾座式气动、执行器分配和执行器动态后，也不应预先把 $4.7\sim7.4\ \mathrm{ms}$
+作为必须达到的指标；应先依据 Release 性能剖析设定更现实的目标。
+
 ## 20. 使用 `paper_control` 控制器跟踪测试 3 轨迹
 
 ### 20.1 闭环连接原则
@@ -7545,3 +8184,141 @@ planning/output/figures/joint_hover_closed_loop_actuators.png
 第一张图对比空间轨迹、位置误差、速度和 yaw；第二张图对比电机实际/指令、舵面
 实际/指令以及机体角速度。竖直虚线表示优化轨迹结束，虚线右侧为额外的 $1\ \mathrm s$
 末端悬停，而不是规划总时间的一部分。
+
+---
+
+## 21. 阶段 C：显式不等式约束联合优化
+
+对应根目录 `study.md` 第 13.6 节路线的第三步。新增实现位于：
+
+```text
+include/planning/actuator_penalty_optimizer.hpp   ConstrainedSolver 枚举与新结构
+src/actuator_penalty_optimizer.cpp                分类型梯度与 optimizeJointConstrained
+apps/generate_stage_c_trajectory.cpp              阶段 C 应用
+tests/test_stage_c.cpp                            回归测试
+include/planning/trajectory_csv.hpp               共享 CSV 写出
+```
+
+### 21.1 从软罚到硬约束的精确改动
+
+阶段 B/测试 3 的目标把十类执行器与高层积分乘以统一罚权加进目标；阶段 C
+把它们逐类注册为 NLopt 不等式行：
+
+```text
+c_k(x) = ∫ [g_k(t)]_+^2 dt ≤ 0,   k = 1..10
+```
+
+其中 $g_k$ 是与软罚完全相同的归一化铰链输入（转速/推力/舵偏/机体角速度/
+速度/总推力/电机动态/舵速/舵机动态）。由于平方铰链非负，$c_k=0$ 当且仅当
+该类型在优化网格的所有采样都位于 `actuator_margin` 规划包络内，与逐采样
+硬约束的可行集完全一致，同时每类只需一行约束而不是数百行。无效平坦映射
+没有可用梯度，保持 `invalid_mapping_penalty` 屏障在目标中；构造失败的
+候选返回目标 $10^{30}$、全部约束行取正值 1、梯度置零。
+
+目标退化为：
+
+$$
+J_C=\rho_s\frac{J_{\mathrm{smooth}}}{J_0}
++\rho_g\|\mathbf u\|^2
++\rho_T T
++\rho_a J_{\mathrm{invalid}}
+$$
+
+时间项 $\rho_T T$ 保留：没有它，任何满足约束的慢轨迹都是同等最优的。
+
+### 21.2 分类型梯度重构
+
+`integrateActuatorPenalty` 现在按 11 类分别积累系数/显式时间偏导，整体偏导
+等于逐类之和，因此软罚路径数值不变（`test_joint_optimizer` 的梯度误差仍为
+1.73e-8，与历史值一致）。阶段 C 对每类各做一次 `propagateCostGradient`，
+组装 10×13 约束 Jacobian；目标只传播 invalid 屏障类。NLopt 的目标回调和
+向量约束回调共享带一步缓存的单次平坦映射积分。
+
+求解器选择经过消融：从深度不可行初值（舵机动态超限约 30 倍）出发，
+`LD_SLSQP` 直接求解在 120 次评估内到达可行；`auglag-mma`、`auglag-ccsaq`、
+`auglag-slsqp` 与直接 `mma` 在 240 次评估预算内均未达标。默认
+`LD_SLSQP`，其余通过 `--solver` 保留。
+
+### 21.3 热启动与冷启动限制
+
+`optimizeJointConstrained` 接受可选热启动（对数时间比与归一化航点偏移），
+应用层默认先跑软罚联合优化再做硬约束精修。原因：yaw `0 -> pi` 的直线初值
+含无效映射样本，屏障区域零梯度让 SLSQP 在不可行点提前收敛（100 次评估、
+最终速度 8.67 m/s）；热启动后同样问题 67 次评估收敛且全部约束行 ≤ 1e-6。
+yaw `0 -> 0` 冷启动可用。热启动点会被裁剪进变量边界。
+
+### 21.4 节点 yaw jerk 非光滑性（阶段 C 排查中发现）
+
+约束 Jacobian 有限差分校验曾出现与步长无关的 0.2-0.7% 偏差，定位过程与
+结论如下：
+
+1. 单侧差分互相一致，说明值函数光滑、解析梯度确有偏差；
+2. 用公开 API 从零重组梯度得到与库完全一致的结果，装配无误；
+3. 合成实验证明样条传播机制对"移动采样点偏导"精确（7.8e-8）；
+4. 逐点对比 $d\omega/dt$：机制值 $J\,\dot\xi$ 与值路径数值导数在分段节点
+   处差 0.4-0.75%，且节点两侧机制值之差恰为中心差分的两倍。
+
+根因：yaw 三次样条只有 $C^2$ 连续，yaw jerk 在节点跳变；电机转速经角加速度
+链依赖 yaw 加速度，故 $d\omega/dt$ 含 $J_{\ddot\psi}\dddot\psi$ 项在节点
+不连续。动力学约束的移动采样项在节点采样处因此只有单侧导数，而中心差分
+给出两侧平均。该偏差在阶段 C 之前同样存在于组合目标梯度，只是被平滑项的
+相对尺度掩盖。这不是错误而是"罚函数采样点恰好落在节点上"的固有性质；
+若要消除，需要让样条求值显式支持按区间取单侧导数。回归测试阈值因此设为
+1e-2，全零或符号错误仍会以 O(1) 误差暴露。
+
+### 21.5 对照结果与读法
+
+15 m、速度约束开启、margin 0.75、每段 50 采样：
+
+| 方法 | yaw0 [s] | yawpi [s] | 规划包络 | 全包络认证 |
+| --- | ---: | ---: | --- | --- |
+| 外层时间缩放 | 4.102958 | 4.101423 | 直接用全包络 | 通过（速度 7.997-7.999） |
+| 软罚联合 | 3.921840 | 3.921941 | 峰值速度超软阈值约 0.8% | 通过 |
+| 阶段 C（热启动） | 3.949076 | 3.948889 | 严格满足（≤4.4e-4） | 通过（速度 6.002 贴界） |
+
+阶段 C 比软罚慢 0.7%，交换到的是规划裕量下的硬保证；软罚解若要同样严格
+需要更大的罚权并承担病态风险。与外层缩放相比，联合方法快约 4.4-4.7%，
+因为航点几何同时参与优化。所有结果仍以 margin 1.0 的 2 ms 稠密
+`FeasibilityChecker` 认证为准——优化网格上的硬约束不排除网格间峰值。
+
+### 21.6 规划耗时优化：惰性 Jacobian 与粗到细热启动
+
+初版阶段 C 完整管线约 22-25 s。微基准定位到单次梯度评估的耗时分布：
+
+```text
+linearize（15 维 AutoDiff 固定分支）   约 837 us/采样
+forward（Jet2 前向映射）               约  46 us/采样
+样条重建 + 平滑能量                     约 180 us/次
+```
+
+50 采样/段、4 段时每次梯度评估约 204 次线性化，占评估成本的九成。两项
+优化（都不触碰最终 2 ms 稠密认证）：
+
+1. 惰性 Jacobian。`integrateActuatorPenalty` 改为三遍结构：值遍对所有
+   采样只调 `forward()` 并计算罚值/显式时间偏导；标记遍找出携带梯度质量的
+   采样（任一幅值铰链激活，或邻接动力学区间的端点槽位非零）并缓存动力学
+   端点槽位；线性化遍只对被标记采样调用新增的
+   `linearize(sample, prediction, roll_branch, pitch_branch)` 重载——它
+   复用值遍的预测和已选姿态分支，省去重复前向。铰链未激活的采样对每类
+   平坦梯度的贡献恰为零，因此结果与全量线性化在浮点舍入意义下等价；
+   全部有限差分梯度校验与端到端约束满足回归保持通过。收益随解接近可行
+   而增大：深度不可行时几乎无节省，接近最优时多数采样被跳过。
+
+2. 粗到细热启动。热启动的软罚预优化在 `20` 采样/段的粗网格上运行
+   （单次评估约为细网格的 1/3 成本），SLSQP 精修保持在 `50` 采样/段。
+   粗网格分辨率存在甜点：yaw `0->pi` 在 15 采样时 L-BFGS 需要 260 次评估
+   才收敛，20 采样只需 64 次，25 采样 93 次；默认取 20。
+
+同一台机器、15 m 工况、三轮平均（含最终认证与 CSV 写出）：
+
+| 方法 | 优化前 | 优化后 |
+| --- | ---: | ---: |
+| 外层时间缩放 | ~9.5 s | ~9.3 s（未改动） |
+| 软罚联合 | ~13.1 s | ~4.2 s |
+| 阶段 C 完整管线，yaw `0->0` | ~22.0 s | ~3.5 s |
+| 阶段 C 完整管线，yaw `0->pi` | ~25.3 s | ~4.4 s |
+
+优化后的轨迹质量不变：两种 yaw 工况总时间均为 3.948-3.949 s（与优化前
+差异小于 0.02%），约束行全部满足，峰值速度仍精确停在 6.0 m/s 规划边界，
+2 ms 全包络稠密认证通过。`test_stage_c` 新增粗网格软罚热启动到约束求解器
+的完整路径覆盖。
