@@ -19,7 +19,8 @@ add_library(tailsitter_planning
     src/actuator_penalty_optimizer.cpp
     src/tailsitter_flatness.cpp
     src/feasibility_checker.cpp
-    src/time_scaler.cpp)
+    src/time_scaler.cpp
+    src/trajectory_csv.cpp)
 
 target_include_directories(tailsitter_planning
     PUBLIC
@@ -39,6 +40,9 @@ target_link_libraries(generate_stage_b_trajectory PRIVATE tailsitter_planning)
 add_executable(generate_joint_hover_trajectory apps/generate_joint_hover_trajectory.cpp)
 target_link_libraries(generate_joint_hover_trajectory PRIVATE tailsitter_planning)
 
+add_executable(generate_stage_c_trajectory apps/generate_stage_c_trajectory.cpp)
+target_link_libraries(generate_stage_c_trajectory PRIVATE tailsitter_planning)
+
 enable_testing()
 add_executable(test_stage_a tests/test_stage_a.cpp)
 target_link_libraries(test_stage_a PRIVATE tailsitter_planning)
@@ -51,3 +55,7 @@ add_test(NAME stage_b COMMAND test_stage_b)
 add_executable(test_joint_optimizer tests/test_joint_optimizer.cpp)
 target_link_libraries(test_joint_optimizer PRIVATE tailsitter_planning)
 add_test(NAME joint_optimizer COMMAND test_joint_optimizer)
+
+add_executable(test_stage_c tests/test_stage_c.cpp)
+target_link_libraries(test_stage_c PRIVATE tailsitter_planning)
+add_test(NAME stage_c COMMAND test_stage_c)

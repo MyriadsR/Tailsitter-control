@@ -8,6 +8,19 @@
 namespace planning
 {
 
+// Stage C constrained solvers. Every entry keeps the same decision variables,
+// objective and explicit inequality constraints; only the NLopt algorithm and
+// the AUGLAG subsolver change.
+enum class ConstrainedSolver
+{
+    AuglagMma,
+    AuglagCcsaq,
+    AuglagSlsqp,
+    Mma,
+    Ccsaq,
+    Slsqp
+};
+
 struct ActuatorPenaltyConfig
 {
     double yaw_weight{1.0};
@@ -19,6 +32,7 @@ struct ActuatorPenaltyConfig
     double invalid_mapping_penalty{10.0};
     bool enable_body_rate_constraint{true};
     bool enable_high_level_constraints{false};
+    bool enable_velocity_constraint{true};
     bool enable_actuator_dynamics{true};
     Eigen::Vector3d auxiliary_half_range{0.5, 0.5, 0.5};
     double tau_bound{5.0};
@@ -26,6 +40,16 @@ struct ActuatorPenaltyConfig
     double time_weight{0.5};
     int max_evaluations{400};
     double relative_tolerance{1e-7};
+    // Stage C explicit-constraint settings. The ten actuator/high-level
+    // integrals become inequality rows; invalid-mapping stays a barrier in the
+    // objective because it has no usable gradient. Direct SLSQP converges to
+    // feasibility from deeply infeasible starts within a modest evaluation
+    // budget; the AUGLAG/MMA/CCSAQ variants remain available for experiments
+    // but need larger budgets on this problem.
+    ConstrainedSolver constrained_solver{ConstrainedSolver::Slsqp};
+    double constraint_tolerance{1e-8};
+    double constraint_satisfaction_tolerance{1e-6};
+    int local_solver_max_evaluations{4000};
 };
 
 struct ActuatorPenaltyIntegral
@@ -79,6 +103,36 @@ struct StageBGradientCheckResult
     std::vector<double> finite_difference;
 };
 
+// Result of the Stage C joint optimization with explicit inequality
+// constraints. `terms.actuator` still reports the full penalty decomposition
+// for diagnostics, but `terms.total` only weights the invalid-mapping barrier
+// from the actuator side; the ten other integrals are constraint rows.
+struct ConstrainedOptimizationResult
+{
+    bool optimized{false};
+    int objective_evaluations{0};
+    int constraint_evaluations{0};
+    std::vector<double> durations;
+    FlatOutputTrajectory::PositionMatrix position_waypoints;
+    StageBObjectiveTerms initial_terms;
+    StageBObjectiveTerms final_terms;
+    std::vector<double> initial_constraint_values;
+    std::vector<double> final_constraint_values;
+    double initial_max_sample_violation{0.0};
+    double final_max_sample_violation{0.0};
+    bool constraints_satisfied{false};
+};
+
+struct ConstraintGradientCheckResult
+{
+    bool valid{false};
+    double maximum_relative_error{0.0};
+    int constraint_rows{0};
+    // Row-major constraint_rows x variable_count Jacobians, flattened.
+    std::vector<double> analytic;
+    std::vector<double> finite_difference;
+};
+
 class ActuatorPenaltyOptimizer
 {
 public:
@@ -98,6 +152,24 @@ public:
         const FlatOutputTrajectory::YawMatrix& yaw_waypoints,
         const std::vector<int>& auxiliary_waypoint_indices) const;
 
+    // Stage C: same variables and parameterization as optimizeJoint, but the
+    // ten per-type actuator/high-level integrals enter as explicit
+    // inequality constraints instead of weighted penalties in the objective.
+    //
+    // The optional warm-start arguments decode into the initial variable
+    // vector (log-duration ratios and normalized waypoint offsets). Passing
+    // the result of the penalty-based optimizeJoint is the recommended
+    // pipeline: the soft solution is nearly feasible, and SLSQP then only
+    // has to polish it onto the hard constraint boundary.
+    ConstrainedOptimizationResult optimizeJointConstrained(
+        const std::vector<double>& initial_durations,
+        const FlatOutputTrajectory::PositionMatrix& nominal_position_waypoints,
+        const FlatOutputTrajectory::YawMatrix& yaw_waypoints,
+        const std::vector<int>& auxiliary_waypoint_indices,
+        const std::vector<double>& warm_start_durations = {},
+        const FlatOutputTrajectory::PositionMatrix& warm_start_positions =
+            FlatOutputTrajectory::PositionMatrix{}) const;
+
     StageBGradientCheckResult checkInitialGradient(
         double total_time,
         const std::vector<double>& initial_durations,
@@ -107,6 +179,22 @@ public:
         double relative_step = 1e-6) const;
 
     StageBGradientCheckResult checkInitialJointGradient(
+        const std::vector<double>& initial_durations,
+        const FlatOutputTrajectory::PositionMatrix& nominal_position_waypoints,
+        const FlatOutputTrajectory::YawMatrix& yaw_waypoints,
+        const std::vector<int>& auxiliary_waypoint_indices,
+        double relative_step = 1e-6) const;
+
+    // Centered finite-difference validation of the explicit constraint
+    // Jacobian at the initial point of optimizeJointConstrained.
+    //
+    // Known non-smoothness: the yaw spline is C2, so yaw jerk jumps at
+    // segment knots while rotor speed depends on yaw acceleration. At knot
+    // samples the moving-sample term of the dynamics rows has a one-sided
+    // derivative, and centered differences see the average of both sides.
+    // The resulting mismatch is below roughly one percent of the affected
+    // row and is inherent to sampling penalties exactly at knots.
+    ConstraintGradientCheckResult checkInitialJointConstraintGradient(
         const std::vector<double>& initial_durations,
         const FlatOutputTrajectory::PositionMatrix& nominal_position_waypoints,
         const FlatOutputTrajectory::YawMatrix& yaw_waypoints,

@@ -816,11 +816,31 @@ ActuatorLinearization TailsitterFlatness::linearize(
         output.failure_reason = "nominal flatness evaluation did not report an attitude branch";
         return output;
     }
+    return linearize(sample,
+                     output.prediction,
+                     output.prediction.roll_branch,
+                     output.prediction.pitch_branch);
+}
+
+ActuatorLinearization TailsitterFlatness::linearize(
+    const FlatOutputSample& sample,
+    const ActuatorPrediction& prediction,
+    int roll_branch,
+    int pitch_branch) const
+{
+    ActuatorLinearization output;
+    if (!prediction.valid || roll_branch < 0 || pitch_branch < 0)
+    {
+        output.failure_reason =
+            "linearization requires a valid prediction with reported branches";
+        return output;
+    }
+    output.prediction = prediction;
 
     const auto nominal = evaluateFixedBranchActuators(
         flatDerivativeInput(sample),
-        output.prediction.roll_branch,
-        output.prediction.pitch_branch,
+        roll_branch,
+        pitch_branch,
         parameters_);
     if (!nominal.valid)
     {
@@ -830,8 +850,8 @@ ActuatorLinearization TailsitterFlatness::linearize(
 
     const auto differentiated = evaluateFixedBranchActuators(
         differentiableFlatDerivativeInput(sample),
-        output.prediction.roll_branch,
-        output.prediction.pitch_branch,
+        roll_branch,
+        pitch_branch,
         parameters_);
     if (!differentiated.valid)
     {
